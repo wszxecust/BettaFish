@@ -30,7 +30,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from InsightEngine import DeepSearchAgent, Settings
 from config import settings
 from utils.github_issues import error_with_issue_link
-from utils.task_runtime import ensure_task, new_task_id, task_log_context, task_output_dir
+from utils.task_runtime import (
+    claim_engine_run,
+    ensure_task,
+    finish_engine_run,
+    latest_task_report,
+    new_task_id,
+    task_log_context,
+    task_output_dir,
+)
 
 
 def main():
@@ -140,9 +148,30 @@ def main():
 
 
 def execute_research(query: str, config: Settings, task_id: str):
-    """在task隔离的日志上下文中执行研究。"""
-    with task_log_context(task_id, "insight"):
-        return _execute_research(query, config, task_id)
+    """保证同一task的Insight Agent只执行一次；其他设备只订阅/查看。"""
+    run_token, run_status = claim_engine_run(task_id, "insight")
+    if run_status == "running":
+        st.info("该任务的Insight Agent已在其他页面运行，本页面不会重复启动。")
+        return False
+    if run_status == "completed":
+        st.info("该任务的Insight Agent已经完成，直接显示已保存结果。")
+        report_path = latest_task_report(task_id, "insight")
+        if report_path and report_path.exists():
+            st.markdown(report_path.read_text(encoding="utf-8"))
+        return True
+
+    success = False
+    try:
+        with task_log_context(task_id, "insight"):
+            success = bool(_execute_research(query, config, task_id))
+        return success
+    finally:
+        finish_engine_run(
+            task_id,
+            "insight",
+            run_token,
+            success=success,
+        )
 
 
 def _execute_research(query: str, config: Settings, task_id: str):
@@ -195,6 +224,7 @@ def _execute_research(query: str, config: Settings, task_id: str):
 
         # 显示结果
         display_results(agent, final_report)
+        return True
 
     except Exception as e:
         import traceback
@@ -206,6 +236,7 @@ def _execute_research(query: str, config: Settings, task_id: str):
         )
         st.error(error_display)
         logger.exception(f"研究过程中发生错误: {str(e)}")
+        return False
 
 
 def display_results(agent: DeepSearchAgent, final_report: str):
