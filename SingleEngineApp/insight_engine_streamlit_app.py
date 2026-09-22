@@ -184,6 +184,13 @@ def execute_research(query: str, config: Settings, task_id: str):
             st.markdown(report_path.read_text(encoding="utf-8"))
         return True
 
+    if run_status == "failed":
+        st.error("该任务的Insight Agent上次运行失败。历史查看不会自动重新执行；请新建研究后重试。")
+        report_path = latest_task_report(task_id, "insight")
+        if report_path and report_path.exists():
+            st.markdown(report_path.read_text(encoding="utf-8"))
+        return False
+
     success = False
     try:
         with task_log_context(task_id, "insight"):
