@@ -185,7 +185,7 @@ class ReportAgent:
     _CONTENT_SPARSE_WARNING_TEXT = "本章LLM生成的内容字数可能过低，必要时可以尝试重新运行程序。"
     _STRUCTURAL_RETRY_ATTEMPTS = 2
     
-    def __init__(self, config: Optional[Settings] = None):
+    def __init__(self, config: Optional[Settings] = None, task_id: Optional[str] = None):
         """
         初始化Report Agent。
         
@@ -200,6 +200,7 @@ class ReportAgent:
         """
         # 加载配置
         self.config = config or settings
+        self.task_id = task_id
         
         # 初始化文件基准管理器
         self.file_baseline = FileCountBaseline()
@@ -243,6 +244,15 @@ class ReportAgent:
         - 【修复】配置实时日志写入，禁用缓冲，确保前端实时看到日志
         - 【修复】防止重复添加handler
         """
+        # task-scoped运行由utils.task_runtime.task_log_context提供带task_id
+        # filter的loguru sink。这里绝不能再添加“捕获所有Report日志”的全局sink，
+        # 否则并发任务会互相写入对方文件。
+        if self.task_id:
+            log_path = Path(self.config.LOG_FILE)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.touch(exist_ok=True)
+            return
+
         # 确保日志目录存在
         log_dir = os.path.dirname(self.config.LOG_FILE)
         os.makedirs(log_dir, exist_ok=True)
@@ -1544,7 +1554,7 @@ class ReportAgent:
         return content
 
 
-def create_agent(config_file: Optional[str] = None) -> ReportAgent:
+def create_agent(config_file: Optional[str] = None, *, config: Optional[Settings] = None, task_id: Optional[str] = None) -> ReportAgent:
     """
     创建Report Agent实例的便捷函数。
     
@@ -1557,5 +1567,5 @@ def create_agent(config_file: Optional[str] = None) -> ReportAgent:
     目前以环境变量驱动 `Settings`，保留 `config_file` 参数便于未来扩展。
     """
     
-    config = Settings() # 以空配置初始化，而从从环境变量初始化
-    return ReportAgent(config)
+    resolved_config = config or Settings()  # 默认仍从环境变量初始化
+    return ReportAgent(resolved_config, task_id=task_id)
