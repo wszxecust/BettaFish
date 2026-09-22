@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from InsightEngine import DeepSearchAgent, Settings
 from config import settings
 from utils.github_issues import error_with_issue_link
-from utils.task_runtime import ensure_task, new_task_id, task_log_context
+from utils.task_runtime import ensure_task, new_task_id, task_log_context, task_output_dir
 
 
 def main():
@@ -132,7 +132,7 @@ def main():
             DB_DIALECT=settings.DB_DIALECT,
             MAX_REFLECTIONS=max_reflections,
             MAX_CONTENT_LENGTH=max_content_length,
-            OUTPUT_DIR="insight_engine_streamlit_reports"
+            OUTPUT_DIR=str(task_output_dir(task_id, "insight"))
         )
 
         # 执行研究
