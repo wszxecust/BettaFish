@@ -144,3 +144,36 @@ def test_latest_report_lookup_never_crosses_task(monkeypatch, tmp_path):
 
     assert latest_task_report("task_report_a", "query") == alpha
     assert latest_task_report("task_report_b", "query") == beta
+
+
+def test_engine_run_claim_is_single_owner(monkeypatch, tmp_path):
+    _use_tmp_runtime(monkeypatch, tmp_path)
+
+    token, status = claim_engine_run("task_once", "query")
+    assert token
+    assert status == "claimed"
+    assert engine_run_status("task_once", "query") == "running"
+
+    second_token, second_status = claim_engine_run("task_once", "query")
+    assert second_token is None
+    assert second_status == "running"
+
+    finish_engine_run("task_once", "query", token, success=True)
+    assert engine_run_status("task_once", "query") == "completed"
+
+    third_token, third_status = claim_engine_run("task_once", "query")
+    assert third_token is None
+    assert third_status == "completed"
+
+
+def test_failed_engine_run_can_be_retried(monkeypatch, tmp_path):
+    _use_tmp_runtime(monkeypatch, tmp_path)
+
+    token, status = claim_engine_run("task_retry", "media")
+    assert status == "claimed"
+    finish_engine_run("task_retry", "media", token, success=False)
+    assert engine_run_status("task_retry", "media") == "idle"
+
+    retry_token, retry_status = claim_engine_run("task_retry", "media")
+    assert retry_token
+    assert retry_status == "claimed"
