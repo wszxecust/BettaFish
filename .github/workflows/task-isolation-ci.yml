@@ -36,6 +36,8 @@ jobs:
             SingleEngineApp/query_engine_streamlit_app.py \
             SingleEngineApp/media_engine_streamlit_app.py \
             SingleEngineApp/insight_engine_streamlit_app.py
+      - name: Check browser bootstrap syntax
+        run: node --check static/task_isolation.js
       - name: Run isolation regression tests
         run: |
           pytest -q \
