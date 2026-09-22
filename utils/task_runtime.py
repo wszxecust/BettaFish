@@ -218,6 +218,9 @@ def finish_engine_run(
     except FileNotFoundError:
         pass
 
+    # 任务完成/失败时间应参与历史列表排序；保留原query等metadata。
+    ensure_task(task_id)
+
 
 def engine_run_status(task_id: str, engine: str) -> str:
     lock_path, done_path, failed_path = _engine_run_paths(task_id, engine)
