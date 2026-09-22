@@ -182,19 +182,19 @@ def _broadcast_event(task_id: str, event: Dict[str, Any]):
 
 
 def _prune_task_history_locked():
-    """
-    在task_lock持有期间调用，清理过多的历史任务。
-
-    仅保留最近 `MAX_TASK_HISTORY` 个任务，避免长时间运行占用过多内存。
-
-    说明:
-        该函数假设调用方已获取 `task_lock`，否则存在竞态风险。
-    """
+    """在持锁状态下只清理最旧的终态任务，绝不移除正在运行的任务。"""
     if len(tasks_registry) <= MAX_TASK_HISTORY:
         return
-    # 按创建时间排序，移除最旧的任务
-    sorted_tasks = sorted(tasks_registry.values(), key=lambda t: t.created_at)
-    for task in sorted_tasks[:-MAX_TASK_HISTORY]:
+
+    terminal_tasks = sorted(
+        (
+            task for task in tasks_registry.values()
+            if task.status in STREAM_TERMINAL_STATUSES
+        ),
+        key=lambda task: task.created_at,
+    )
+    removable_count = max(0, len(tasks_registry) - MAX_TASK_HISTORY)
+    for task in terminal_tasks[:removable_count]:
         tasks_registry.pop(task.task_id, None)
 
 
