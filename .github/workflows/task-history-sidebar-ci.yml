@@ -1,0 +1,38 @@
+name: Temporary task history sidebar checks
+
+on:
+  push:
+    branches:
+      - feat/task-history-sidebar
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install minimal test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest flask requests loguru
+      - name: Compile changed Python files
+        run: |
+          python -m py_compile \
+            app.py \
+            utils/task_runtime.py \
+            SingleEngineApp/query_engine_streamlit_app.py \
+            SingleEngineApp/media_engine_streamlit_app.py \
+            SingleEngineApp/insight_engine_streamlit_app.py
+      - name: Check browser scripts
+        run: |
+          node --check static/task_isolation.js
+          node --check static/task_sidebar.js
+      - name: Run task history regression tests
+        run: |
+          pytest -q \
+            tests/test_task_runtime_isolation.py \
+            tests/test_search_route.py \
+            tests/test_report_cancel_route.py \
+            tests/test_monitor.py
