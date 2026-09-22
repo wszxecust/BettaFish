@@ -171,17 +171,18 @@ def test_engine_run_claim_is_single_owner(monkeypatch, tmp_path):
     assert third_status == "completed"
 
 
-def test_failed_engine_run_can_be_retried(monkeypatch, tmp_path):
+def test_failed_engine_run_stays_failed_when_history_is_open(monkeypatch, tmp_path):
     _use_tmp_runtime(monkeypatch, tmp_path)
 
-    token, status = claim_engine_run("task_retry", "media")
+    token, status = claim_engine_run("task_failed", "media")
     assert status == "claimed"
-    finish_engine_run("task_retry", "media", token, success=False)
-    assert engine_run_status("task_retry", "media") == "failed"
+    finish_engine_run("task_failed", "media", token, success=False)
+    assert engine_run_status("task_failed", "media") == "failed"
 
-    retry_token, retry_status = claim_engine_run("task_retry", "media")
-    assert retry_token
-    assert retry_status == "claimed"
+    second_token, second_status = claim_engine_run("task_failed", "media")
+    assert second_token is None
+    assert second_status == "failed"
+    assert engine_run_status("task_failed", "media") == "failed"
 
 
 
