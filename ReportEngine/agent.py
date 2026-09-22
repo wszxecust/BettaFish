@@ -202,8 +202,8 @@ class ReportAgent:
         self.config = config or settings
         self.task_id = task_id
         
-        # 初始化文件基准管理器
-        self.file_baseline = FileCountBaseline()
+        # task-scoped ReportAgent不读取/写入历史全局baseline；仅legacy CLI保留。
+        self.file_baseline = None if self.task_id else FileCountBaseline()
         
         # 初始化日志
         self._setup_logging()
@@ -337,6 +337,8 @@ class ReportAgent:
             'media': 'media_engine_streamlit_reports',
             'query': 'query_engine_streamlit_reports'
         }
+        if self.file_baseline is None:
+            return
         self.file_baseline.initialize_baseline(directories)
     
     def _initialize_llm(self) -> LLMClient:
