@@ -50,6 +50,7 @@ class DeepSearchAgent:
             config: 可选配置对象（不填则用全局settings）
         """
         self.config = config or settings
+        self.task_id = task_id
         self.task_id = ensure_task(task_id or new_task_id())
         self.output_dir = str(task_output_dir(self.task_id, "insight"))
 
