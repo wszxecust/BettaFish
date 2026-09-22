@@ -51,6 +51,32 @@ def task_logs_dir(task_id: str) -> Path:
     return task_dir(task_id) / "logs"
 
 
+def task_clients_dir(task_id: str) -> Path:
+    return task_dir(task_id) / "clients"
+
+
+def register_task_client(task_id: str, client_id: str) -> str:
+    task_id = validate_runtime_id(task_id)
+    client_id = validate_runtime_id(client_id, "client_id")
+    directory = task_clients_dir(task_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    # Marker files avoid a shared mutable client list and are safe when
+    # different Streamlit worker processes register the same task concurrently.
+    (directory / client_id).touch(exist_ok=True)
+    return client_id
+
+
+def list_task_clients(task_id: str) -> list[str]:
+    directory = task_clients_dir(task_id)
+    if not directory.exists():
+        return []
+    result = []
+    for entry in directory.iterdir():
+        if entry.is_file() and _ID_RE.fullmatch(entry.name):
+            result.append(entry.name)
+    return sorted(set(result))
+
+
 def task_log_path(task_id: str, component: str) -> Path:
     component = component.lower().strip()
     if component not in _ENGINE_NAMES:
@@ -93,6 +119,9 @@ def ensure_task(
     root = task_dir(task_id)
     task_logs_dir(task_id).mkdir(parents=True, exist_ok=True)
     task_outputs_dir(task_id).mkdir(parents=True, exist_ok=True)
+    task_clients_dir(task_id).mkdir(parents=True, exist_ok=True)
+    if client_id:
+        register_task_client(task_id, client_id)
 
     metadata_path = task_metadata_path(task_id)
     metadata: Dict[str, str] = {}
