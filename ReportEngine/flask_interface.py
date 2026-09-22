@@ -501,7 +501,8 @@ def run_report_generation(task: ReportTask, query: str, custom_template: str = "
                     forum_logs=content['forum_logs'],
                     custom_template=custom_template,
                     save_report=True,
-                    stream_handler=stream_handler
+                    stream_handler=stream_handler,
+                    research_task_id=task.research_task_id,
                 )
                 break
             except ChapterJsonParseError as err:
