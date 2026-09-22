@@ -37,6 +37,7 @@ class DeepSearchAgent:
         # 加载配置
         from .utils.config import settings
         self.config = config or settings
+        self.task_id = task_id
         self.task_id = ensure_task(task_id or new_task_id())
         self.output_dir = str(task_output_dir(self.task_id, "query"))
         
