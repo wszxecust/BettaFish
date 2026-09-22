@@ -7,7 +7,10 @@ from loguru import logger
 
 from ForumEngine.task_store import append_event, latest_host_speech, list_events, publish_agent_speech
 from utils.task_runtime import (
+    claim_engine_run,
+    engine_run_status,
     ensure_task,
+    finish_engine_run,
     latest_task_report,
     list_task_clients,
     task_log_context,
