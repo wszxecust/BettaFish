@@ -35,6 +35,7 @@ class DeepSearchAgent:
             config: 配置对象，如果不提供则自动加载
         """
         self.config = config or settings
+        self.task_id = task_id
         self.task_id = ensure_task(task_id or new_task_id())
         self.output_dir = str(task_output_dir(self.task_id, "media"))
         
