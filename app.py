@@ -16,13 +16,23 @@ import threading
 from datetime import datetime
 from queue import Queue
 from flask import Flask, render_template, request, jsonify, Response
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO, emit, join_room
 import atexit
 import requests
 from loguru import logger
 import importlib
 from pathlib import Path
 from MindSpider.main import MindSpider
+from ForumEngine.task_store import initialize_task_forum, list_events, render_forum_log
+from utils.task_runtime import (
+    ensure_task,
+    list_task_ids,
+    new_client_id,
+    new_task_id,
+    read_task_metadata,
+    task_log_path,
+    validate_runtime_id,
+)
 
 # 导入ReportEngine
 try:
@@ -340,160 +350,134 @@ def initialize_system_components():
     return True, logs, []
 
 # 初始化ForumEngine的forum.log文件
-def init_forum_log():
-    """初始化forum.log文件"""
-    try:
-        forum_log_file = LOG_DIR / "forum.log"
-        # 检查文件不存在则创建并且写一个开始，存在就清空写一个开始
-        if not forum_log_file.exists():
-            with open(forum_log_file, 'w', encoding='utf-8') as f:
-                start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                f.write(f"=== ForumEngine 系统初始化 - {start_time} ===\n")
-            logger.info(f"ForumEngine: forum.log 已初始化")
-        else:
-            with open(forum_log_file, 'w', encoding='utf-8') as f:
-                start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                f.write(f"=== ForumEngine 系统初始化 - {start_time} ===\n")
-            logger.info(f"ForumEngine: forum.log 已初始化")
-    except Exception as e:
-        logger.exception(f"ForumEngine: 初始化forum.log失败: {e}")
-
-# 初始化forum.log
-init_forum_log()
-
-# 启动ForumEngine智能监控
 def start_forum_engine():
-    """启动ForumEngine论坛"""
-    try:
-        from ForumEngine.monitor import start_forum_monitoring
-        logger.info("ForumEngine: 启动论坛...")
-        success = start_forum_monitoring()
-        if not success:
-            logger.info("ForumEngine: 论坛启动失败")
-    except Exception as e:
-        logger.exception(f"ForumEngine: 启动论坛失败: {e}")
+    """Forum现在是task-scoped事件服务，无需全局日志监控进程。"""
+    logger.info("ForumEngine: task-scoped事件服务已就绪")
+    return True
 
-# 停止ForumEngine智能监控
+
 def stop_forum_engine():
-    """停止ForumEngine论坛"""
+    """Forum事件存储随任务存在；停止操作不删除任何任务数据。"""
+    logger.info("ForumEngine: task-scoped事件服务无需单独停止")
+    return True
+
+
+def _forum_event_to_message(event):
+    """将结构化Forum事件转换为现有前端可消费的消息格式。"""
+    source = str(event.get('source', '')).upper()
+    if source == 'SYSTEM' or source not in {'QUERY', 'INSIGHT', 'MEDIA', 'HOST'}:
+        return None
     try:
-        from ForumEngine.monitor import stop_forum_monitoring
-        logger.info("ForumEngine: 停止论坛...")
-        stop_forum_monitoring()
-        logger.info("ForumEngine: 论坛已停止")
-    except Exception as e:
-        logger.exception(f"ForumEngine: 停止论坛失败: {e}")
+        created = datetime.fromisoformat(str(event.get('created_at', '')))
+        timestamp = created.astimezone().strftime('%H:%M:%S')
+    except Exception:
+        timestamp = datetime.now().strftime('%H:%M:%S')
 
-def parse_forum_log_line(line):
-    """解析forum.log行内容，提取对话信息"""
-    import re
-    
-    # 匹配格式: [时间] [来源] 内容（来源允许大小写及空格）
-    pattern = r'\[(\d{2}:\d{2}:\d{2})\]\s*\[([^\]]+)\]\s*(.*)'
-    match = re.match(pattern, line)
-    
-    if not match:
-        return None
-
-    timestamp, raw_source, content = match.groups()
-    source = raw_source.strip().upper()
-
-    # 过滤掉系统消息和空内容
-    if source == 'SYSTEM' or not content.strip():
-        return None
-    
-    # 支持三个Agent和主持人
-    if source not in ['QUERY', 'INSIGHT', 'MEDIA', 'HOST']:
-        return None
-    
-    # 解码日志中的转义换行，保留多行格式
-    cleaned_content = content.replace('\\n', '\n').replace('\\r', '').strip()
-    
-    # 根据来源确定消息类型和发送者
-    if source == 'HOST':
-        message_type = 'host'
-        sender = 'Forum Host'
-    else:
-        message_type = 'agent'
-        sender = f'{source.title()} Engine'
-    
     return {
-        'type': message_type,
-        'sender': sender,
-        'content': cleaned_content,
+        'type': 'host' if source == 'HOST' else 'agent',
+        'sender': 'Forum Host' if source == 'HOST' else f'{source.title()} Engine',
+        'content': str(event.get('content', '')).strip(),
         'timestamp': timestamp,
-        'source': source
+        'source': source,
+        'task_id': event.get('task_id')
     }
 
-# Forum日志监听器
-# 存储每个客户端的历史日志发送位置
-forum_log_positions = {}
 
-def monitor_forum_log():
-    """监听forum.log文件变化并推送到前端"""
-    import time
-    from pathlib import Path
+def _forum_event_to_log_line(event):
+    message = _forum_event_to_message(event)
+    if not message:
+        return None
+    content = message['content'].replace('\n', '\\n').replace('\r', '\\r')
+    return f"[{message['timestamp']}] [{message['source']}] {content}"
 
-    forum_log_file = LOG_DIR / "forum.log"
-    last_position = 0
-    processed_lines = set()  # 用于跟踪已处理的行，避免重复
 
-    # 如果文件存在，获取初始位置但不跳过内容
-    if forum_log_file.exists():
-        with open(forum_log_file, 'r', encoding='utf-8', errors='ignore') as f:
-            # 记录文件大小，但不添加到processed_lines
-            # 这样用户打开forum标签时可以获取历史
-            f.seek(0, 2)  # 移到文件末尾
-            last_position = f.tell()
+def _client_room(client_id):
+    return f"client:{validate_runtime_id(client_id, 'client_id')}"
 
+
+def _task_client_room(task_id):
+    metadata = read_task_metadata(task_id)
+    client_id = metadata.get('client_id')
+    if not client_id:
+        return None
+    try:
+        return _client_room(client_id)
+    except ValueError:
+        return None
+
+
+forum_event_positions = {}
+task_log_positions = {}
+
+
+def _read_new_task_log_lines(task_id, app_name):
+    """增量读取单个task/agent日志；位置也按(task, agent)隔离。"""
+    path = task_log_path(task_id, app_name)
+    key = (task_id, app_name)
+    if not path.exists():
+        return []
+
+    try:
+        current_size = path.stat().st_size
+        last_position = task_log_positions.get(key, 0)
+        if current_size < last_position:
+            last_position = 0
+        with open(path, 'r', encoding='utf-8', errors='ignore') as stream:
+            stream.seek(last_position)
+            lines = [line.rstrip('\n\r') for line in stream if line.strip()]
+            task_log_positions[key] = stream.tell()
+        return lines
+    except Exception as exc:
+        logger.warning(f"task={task_id} 读取{app_name}日志失败: {exc}")
+        return []
+
+
+def monitor_task_runtime():
+    """只向创建该task的浏览器tab推送Forum事件和Agent日志。"""
     while True:
         try:
-            if forum_log_file.exists():
-                with open(forum_log_file, 'r', encoding='utf-8', errors='ignore') as f:
-                    f.seek(last_position)
-                    new_lines = f.readlines()
+            for task_id in list_task_ids():
+                room = _task_client_room(task_id)
+                if not room:
+                    continue
 
-                    if new_lines:
-                        for line in new_lines:
-                            line = line.rstrip('\n\r')
-                            if line.strip():
-                                line_hash = hash(line.strip())
+                after_id = forum_event_positions.get(task_id, 0)
+                events = list_events(task_id, after_id=after_id, limit=1000)
+                for event in events:
+                    message = _forum_event_to_message(event)
+                    if message:
+                        socketio.emit('forum_message', message, room=room)
+                        line = _forum_event_to_log_line(event)
+                        if line:
+                            socketio.emit(
+                                'console_output',
+                                {'app': 'forum', 'line': line, 'task_id': task_id},
+                                room=room,
+                            )
+                    forum_event_positions[task_id] = max(
+                        forum_event_positions.get(task_id, 0),
+                        int(event.get('id', 0)),
+                    )
 
-                                # 避免重复处理同一行
-                                if line_hash in processed_lines:
-                                    continue
+                for app_name in ('insight', 'media', 'query'):
+                    for line in _read_new_task_log_lines(task_id, app_name):
+                        socketio.emit(
+                            'console_output',
+                            {'app': app_name, 'line': line, 'task_id': task_id},
+                            room=room,
+                        )
+            time.sleep(0.5)
+        except Exception as exc:
+            logger.exception(f"task runtime监听异常: {exc}")
+            time.sleep(2)
 
-                                processed_lines.add(line_hash)
 
-                                # 解析日志行并发送forum消息
-                                parsed_message = parse_forum_log_line(line)
-                                if parsed_message:
-                                    socketio.emit('forum_message', parsed_message)
-
-                                # 只有在控制台显示forum时才发送控制台消息
-                                timestamp = datetime.now().strftime('%H:%M:%S')
-                                formatted_line = f"[{timestamp}] {line}"
-                                socketio.emit('console_output', {
-                                    'app': 'forum',
-                                    'line': formatted_line
-                                })
-
-                        last_position = f.tell()
-
-                        # 清理processed_lines集合，避免内存泄漏（保留最近1000行的哈希）
-                        if len(processed_lines) > 1000:
-                            # 保留最近500行的哈希
-                            recent_hashes = list(processed_lines)[-500:]
-                            processed_lines = set(recent_hashes)
-
-            time.sleep(1)  # 每秒检查一次
-        except Exception as e:
-            logger.error(f"Forum日志监听错误: {e}")
-            time.sleep(5)
-
-# 启动Forum日志监听线程
-forum_monitor_thread = threading.Thread(target=monitor_forum_log, daemon=True)
-forum_monitor_thread.start()
+task_runtime_monitor_thread = threading.Thread(
+    target=monitor_task_runtime,
+    daemon=True,
+    name='task-runtime-monitor',
+)
+task_runtime_monitor_thread.start()
 
 # 全局变量存储进程信息
 processes = {
@@ -532,178 +516,118 @@ output_queues = {
     'forum': Queue()
 }
 
-def write_log_to_file(app_name, line):
-    """将日志写入文件"""
-    try:
-        log_file_path = LOG_DIR / f"{app_name}.log"
-        with open(log_file_path, 'a', encoding='utf-8') as f:
-            f.write(line + '\n')
-            f.flush()
-    except Exception as e:
-        logger.error(f"Error writing log for {app_name}: {e}")
+def write_log_to_file(app_name, line, task_id=None):
+    """写入task私有日志。研究日志禁止回退到logs/<agent>.log。"""
+    if not task_id:
+        raise ValueError("写入研究日志必须提供task_id")
+    path = task_log_path(task_id, app_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'a', encoding='utf-8') as stream:
+        stream.write(str(line) + '\n')
+        stream.flush()
 
-def read_log_from_file(app_name, tail_lines=None):
-    """从文件读取日志"""
+
+def read_log_from_file(app_name, tail_lines=None, task_id=None):
+    """读取指定task的Agent/Forum日志，不读取历史全局共享文件。"""
+    if not task_id:
+        return []
     try:
-        log_file_path = LOG_DIR / f"{app_name}.log"
-        if not log_file_path.exists():
-            return []
-        
-        with open(log_file_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-            lines = [line.rstrip('\n\r') for line in lines if line.strip()]
-            
-            if tail_lines:
-                return lines[-tail_lines:]
-            return lines
-    except Exception as e:
-        logger.exception(f"Error reading log for {app_name}: {e}")
+        task_id = validate_runtime_id(task_id)
+        if app_name == 'forum':
+            lines = [line for line in render_forum_log(task_id).splitlines() if line.strip()]
+        else:
+            path = task_log_path(task_id, app_name)
+            if not path.exists():
+                return []
+            with open(path, 'r', encoding='utf-8', errors='ignore') as stream:
+                lines = [line.rstrip('\n\r') for line in stream if line.strip()]
+        if tail_lines:
+            return lines[-int(tail_lines):]
+        return lines
+    except Exception as exc:
+        logger.exception(f"task={task_id} 读取{app_name}日志失败: {exc}")
         return []
 
+
 def read_process_output(process, app_name):
-    """读取进程输出并写入文件"""
+    """Drain shared Streamlit stdout without persisting/broadcasting research text."""
     import select
     import sys
-    
+
     while True:
         try:
             if process.poll() is not None:
-                # 进程结束，读取剩余输出
-                remaining_output = process.stdout.read()
-                if remaining_output:
-                    lines = remaining_output.decode('utf-8', errors='replace').split('\n')
-                    for line in lines:
-                        line = line.strip()
-                        if line:
-                            timestamp = datetime.now().strftime('%H:%M:%S')
-                            formatted_line = f"[{timestamp}] {line}"
-                            write_log_to_file(app_name, formatted_line)
-                            socketio.emit('console_output', {
-                                'app': app_name,
-                                'line': formatted_line
-                            })
+                if process.stdout:
+                    process.stdout.read()
                 break
-            
-            # 使用非阻塞读取
             if sys.platform == 'win32':
-                # Windows下使用不同的方法
                 output = process.stdout.readline()
-                if output:
-                    line = output.decode('utf-8', errors='replace').strip()
-                    if line:
-                        timestamp = datetime.now().strftime('%H:%M:%S')
-                        formatted_line = f"[{timestamp}] {line}"
-                        
-                        # 写入日志文件
-                        write_log_to_file(app_name, formatted_line)
-                        
-                        # 发送到前端
-                        socketio.emit('console_output', {
-                            'app': app_name,
-                            'line': formatted_line
-                        })
-                else:
-                    # 没有输出时短暂休眠
+                if not output:
                     time.sleep(0.1)
             else:
-                # Unix系统使用select
                 ready, _, _ = select.select([process.stdout], [], [], 0.1)
                 if ready:
-                    output = process.stdout.readline()
-                    if output:
-                        line = output.decode('utf-8', errors='replace').strip()
-                        if line:
-                            timestamp = datetime.now().strftime('%H:%M:%S')
-                            formatted_line = f"[{timestamp}] {line}"
-                            
-                            # 写入日志文件
-                            write_log_to_file(app_name, formatted_line)
-                            
-                            # 发送到前端
-                            socketio.emit('console_output', {
-                                'app': app_name,
-                                'line': formatted_line
-                            })
-                            
-        except Exception as e:
-            error_msg = f"Error reading output for {app_name}: {e}"
-            logger.exception(error_msg)
-            write_log_to_file(app_name, f"[{datetime.now().strftime('%H:%M:%S')}] {error_msg}")
+                    process.stdout.readline()
+        except Exception as exc:
+            logger.warning(f"读取{app_name}子进程stdout失败: {exc}")
             break
 
+
 def start_streamlit_app(app_name, script_path, port):
-    """启动Streamlit应用"""
+    """启动共享Streamlit服务；具体研究会话由task_id隔离。"""
     try:
         if processes[app_name]['process'] is not None:
             return False, "应用已经在运行"
-        
-        # 检查文件是否存在
         if not os.path.exists(script_path):
             return False, f"文件不存在: {script_path}"
-        
-        # 清空之前的日志文件
-        log_file_path = LOG_DIR / f"{app_name}.log"
-        if log_file_path.exists():
-            log_file_path.unlink()
-        
-        # 创建启动日志
-        start_msg = f"[{datetime.now().strftime('%H:%M:%S')}] 启动 {app_name} 应用..."
-        write_log_to_file(app_name, start_msg)
-        
+
+        logger.info(f"启动 {app_name} Streamlit服务")
         cmd = [
             sys.executable, '-m', 'streamlit', 'run',
             script_path,
             '--server.port', str(port),
             '--server.headless', 'true',
             '--browser.gatherUsageStats', 'false',
-            # '--logger.level', 'debug',  # 增加日志详细程度
             '--logger.level', 'info',
             '--server.enableCORS', 'false'
         ]
-        
-        # 设置环境变量确保UTF-8编码和减少缓冲
         env = os.environ.copy()
         env.update({
             'PYTHONIOENCODING': 'utf-8',
             'PYTHONUTF8': '1',
             'LANG': 'en_US.UTF-8',
             'LC_ALL': 'en_US.UTF-8',
-            'PYTHONUNBUFFERED': '1',  # 禁用Python缓冲
+            'PYTHONUNBUFFERED': '1',
             'STREAMLIT_BROWSER_GATHER_USAGE_STATS': 'false'
         })
-        
-        # 使用当前工作目录而不是脚本目录
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            bufsize=0,  # 无缓冲
+            bufsize=0,
             universal_newlines=False,
             cwd=os.getcwd(),
             env=env,
-            encoding=None,  # 让我们手动处理编码
+            encoding=None,
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
         )
-        
+
         processes[app_name]['process'] = process
         processes[app_name]['status'] = 'starting'
         processes[app_name]['output'] = []
         processes[app_name]['healthcheck_started_at'] = time.time()
-        
-        # 启动输出读取线程
-        output_thread = threading.Thread(
+
+        threading.Thread(
             target=read_process_output,
             args=(process, app_name),
-            daemon=True
-        )
-        output_thread.start()
-        
+            daemon=True,
+            name=f"{app_name}-stdout-drain",
+        ).start()
         return True, f"{app_name} 应用启动中..."
-        
-    except Exception as e:
-        error_msg = f"启动失败: {str(e)}"
-        write_log_to_file(app_name, f"[{datetime.now().strftime('%H:%M:%S')}] {error_msg}")
-        return False, error_msg
+    except Exception as exc:
+        logger.exception(f"启动{app_name}失败: {exc}")
+        return False, f"启动失败: {exc}"
+
 
 def stop_streamlit_app(app_name):
     """停止Streamlit应用"""
@@ -712,16 +636,12 @@ def stop_streamlit_app(app_name):
         if process is None:
             _log_shutdown_step(f"{app_name} 未运行，跳过停止")
             return False, "应用未运行"
-        
         try:
             pid = process.pid
         except Exception:
             pid = 'unknown'
-
         _log_shutdown_step(f"正在停止 {app_name} (pid={pid})")
         process.terminate()
-        
-        # 等待进程结束
         try:
             process.wait(timeout=5)
             _log_shutdown_step(f"{app_name} 退出完成，returncode={process.returncode}")
@@ -730,16 +650,14 @@ def stop_streamlit_app(app_name):
             process.kill()
             process.wait()
             _log_shutdown_step(f"{app_name} 已强制结束，returncode={process.returncode}")
-        
         processes[app_name]['process'] = None
         processes[app_name]['status'] = 'stopped'
         processes[app_name]['healthcheck_started_at'] = None
-        
         return True, f"{app_name} 应用已停止"
-        
-    except Exception as e:
-        _log_shutdown_step(f"{app_name} 停止失败: {e}")
-        return False, f"停止失败: {str(e)}"
+    except Exception as exc:
+        _log_shutdown_step(f"{app_name} 停止失败: {exc}")
+        return False, f"停止失败: {exc}"
+
 
 HEALTHCHECK_PATH = "/_stcore/health"
 HEALTHCHECK_PROXIES = {'http': None, 'https': None}
@@ -928,8 +846,14 @@ atexit.register(cleanup_processes)
 
 @app.route('/')
 def index():
-    """主页"""
-    return render_template('index.html')
+    """主页：先加载task隔离bootstrap，再执行旧版页面脚本。"""
+    html = render_template('index.html')
+    bootstrap = '<script src="/static/task_isolation.js"></script>'
+    if '<head>' in html:
+        html = html.replace('<head>', '<head>' + bootstrap, 1)
+    else:
+        html = bootstrap + html
+    return Response(html, mimetype='text/html')
 
 @app.route('/api/status')
 def get_status():
