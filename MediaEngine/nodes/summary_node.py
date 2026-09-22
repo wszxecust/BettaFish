@@ -30,18 +30,24 @@ except ImportError:
     FORUM_READER_AVAILABLE = False
     logger.warning("无法导入forum_reader模块，将跳过HOST发言读取功能")
 
+from ForumEngine.task_store import publish_agent_speech
+
 
 class FirstSummaryNode(StateMutationNode):
     """根据搜索结果生成段落首次总结的节点"""
     
-    def __init__(self, llm_client):
+    def __init__(self, llm_client, task_id=None, agent_source="MEDIA"):
         """
         初始化首次总结节点
         
         Args:
             llm_client: LLM客户端
+            task_id: 当前研究任务ID
+            agent_source: Forum中的Agent来源标签
         """
         super().__init__(llm_client, "FirstSummaryNode")
+        self.task_id = task_id
+        self.agent_source = agent_source
     
     def validate_input(self, input_data: Any) -> bool:
         """验证输入数据"""
@@ -79,9 +85,9 @@ class FirstSummaryNode(StateMutationNode):
                 data = input_data.copy() if isinstance(input_data, dict) else input_data
             
             # 读取最新的HOST发言（如果可用）
-            if FORUM_READER_AVAILABLE:
+            if FORUM_READER_AVAILABLE and self.task_id:
                 try:
-                    host_speech = get_latest_host_speech()
+                    host_speech = get_latest_host_speech(self.task_id)
                     if host_speech:
                         # 将HOST发言添加到输入数据中
                         data['host_speech'] = host_speech
@@ -107,6 +113,18 @@ class FirstSummaryNode(StateMutationNode):
             
             # 处理响应
             processed_response = self.process_output(response)
+
+            if self.task_id and processed_response:
+                try:
+                    publish_agent_speech(
+                        self.task_id,
+                        self.agent_source,
+                        processed_response,
+                    )
+                except Exception as forum_error:
+                    logger.exception(
+                        f"task={self.task_id} 发布Forum发言失败: {forum_error}"
+                    )
             
             logger.info("成功生成首次段落总结")
             return processed_response
@@ -202,14 +220,18 @@ class FirstSummaryNode(StateMutationNode):
 class ReflectionSummaryNode(StateMutationNode):
     """根据反思搜索结果更新段落总结的节点"""
     
-    def __init__(self, llm_client):
+    def __init__(self, llm_client, task_id=None, agent_source="MEDIA"):
         """
         初始化反思总结节点
         
         Args:
             llm_client: LLM客户端
+            task_id: 当前研究任务ID
+            agent_source: Forum中的Agent来源标签
         """
         super().__init__(llm_client, "ReflectionSummaryNode")
+        self.task_id = task_id
+        self.agent_source = agent_source
     
     def validate_input(self, input_data: Any) -> bool:
         """验证输入数据"""
@@ -247,9 +269,9 @@ class ReflectionSummaryNode(StateMutationNode):
                 data = input_data.copy() if isinstance(input_data, dict) else input_data
             
             # 读取最新的HOST发言（如果可用）
-            if FORUM_READER_AVAILABLE:
+            if FORUM_READER_AVAILABLE and self.task_id:
                 try:
-                    host_speech = get_latest_host_speech()
+                    host_speech = get_latest_host_speech(self.task_id)
                     if host_speech:
                         # 将HOST发言添加到输入数据中
                         data['host_speech'] = host_speech
@@ -275,6 +297,18 @@ class ReflectionSummaryNode(StateMutationNode):
             
             # 处理响应
             processed_response = self.process_output(response)
+
+            if self.task_id and processed_response:
+                try:
+                    publish_agent_speech(
+                        self.task_id,
+                        self.agent_source,
+                        processed_response,
+                    )
+                except Exception as forum_error:
+                    logger.exception(
+                        f"task={self.task_id} 发布Forum发言失败: {forum_error}"
+                    )
             
             logger.info("成功生成反思总结")
             return processed_response
