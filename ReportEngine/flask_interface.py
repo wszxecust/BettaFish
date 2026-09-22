@@ -13,6 +13,7 @@ import threading
 import time
 from collections import deque, defaultdict
 from datetime import datetime
+from uuid import uuid4
 from pathlib import Path
 from queue import Queue, Empty
 from flask import Blueprint, request, jsonify, Response, send_file, stream_with_context
@@ -22,7 +23,14 @@ from .agent import ReportAgent, create_agent
 from .nodes import ChapterJsonParseError
 from .utils.config import settings
 from ForumEngine.task_store import render_forum_log
-from utils.task_runtime import latest_task_report, validate_runtime_id
+from utils.task_runtime import (
+    ensure_task,
+    latest_task_report,
+    task_log_context,
+    task_log_path,
+    task_output_dir,
+    validate_runtime_id,
+)
 
 
 # 创建Blueprint
@@ -35,7 +43,7 @@ task_lock = threading.Lock()
 
 # ====== 流式推送与任务历史管理 ======
 # 通过有界deque缓存最近的事件，方便SSE断线后快速补发
-MAX_TASK_HISTORY = 5
+MAX_TASK_HISTORY = 50
 STREAM_HEARTBEAT_INTERVAL = 15  # 心跳间隔秒
 STREAM_IDLE_TIMEOUT = 120  # 终态后最长保活时间，避免孤儿SSE阻塞
 STREAM_TERMINAL_STATUSES = {"completed", "error", "cancelled"}
@@ -74,22 +82,17 @@ def _is_excluded_engine_log(record: Dict[str, Any]) -> bool:
 
 
 def _stream_log_to_task(message):
-    """
-    将loguru日志同步到当前任务的SSE事件，保证前端实时可见。
-
-    仅在存在运行中的任务时推送，避免无关日志刷屏。
-    """
+    """把Report日志只转发给产生该日志的report task。"""
     try:
         record = message.record
         level_name = record["level"].name
-        if level_name not in LOG_STREAM_LEVELS:
-            return
-        if _is_excluded_engine_log(record):
+        if level_name not in LOG_STREAM_LEVELS or _is_excluded_engine_log(record):
             return
 
-        with task_lock:
-            task = current_task
-
+        report_task_id = record["extra"].get("report_task_id")
+        if not report_task_id:
+            return
+        task = _get_task(str(report_task_id))
         if not task or task.status not in ("running", "pending"):
             return
 
@@ -107,7 +110,7 @@ def _stream_log_to_task(message):
             },
         )
     except Exception:
-        # 避免在日志钩子里产生日志递归
+        # 日志钩子不能再产生日志，否则会递归。
         pass
 
 
@@ -214,6 +217,34 @@ def _get_task(task_id: str) -> Optional['ReportTask']:
         return tasks_registry.get(task_id)
 
 
+def _latest_report_task_for_research(research_task_id: Optional[str]) -> Optional['ReportTask']:
+    """返回某个research task最近一次Report任务，不暴露其他用户任务。"""
+    if not research_task_id:
+        return None
+    with task_lock:
+        matches = [
+            task for task in tasks_registry.values()
+            if task.research_task_id == research_task_id
+        ]
+    return max(matches, key=lambda task: task.created_at) if matches else None
+
+
+def _build_task_report_config(research_task_id: str):
+    """复制Report配置，并把所有可写目录重定向到当前research task。"""
+    research_task_id = validate_runtime_id(research_task_id)
+    output_root = task_output_dir(research_task_id, "report")
+    overrides = {
+        "OUTPUT_DIR": str(output_root),
+        "CHAPTER_OUTPUT_DIR": str(output_root / "chapters"),
+        "DOCUMENT_IR_OUTPUT_DIR": str(output_root / "ir"),
+        "LOG_FILE": str(task_log_path(research_task_id, "report")),
+        "JSON_ERROR_LOG_DIR": str(output_root / "json_repair_failures"),
+    }
+    if hasattr(settings, "model_copy"):
+        return settings.model_copy(deep=True, update=overrides)
+    return settings.copy(deep=True, update=overrides)
+
+
 def _format_sse(event: Dict[str, Any]) -> str:
     """
     按SSE协议格式化消息。
@@ -246,30 +277,23 @@ def _safe_filename_segment(value: str, fallback: str = "report") -> str:
 
 
 def initialize_report_engine():
-    """
-    初始化Report Engine。
-
-    单例化 ReportAgent，方便 API 启动后直接接收任务。
-
-    返回:
-        bool: 初始化成功返回True，异常时返回False。
-    """
+    """初始化task-scoped Report服务，不创建共享的有状态ReportAgent。"""
     global report_agent
     try:
-        report_agent = create_agent()
-        logger.info("Report Engine初始化成功")
+        # 使用truthy sentinel表示配置/接口已就绪。真正的ReportAgent会在
+        # 每个report task线程中独立创建，因此self.state绝不会跨任务共享。
+        report_agent = True
         _setup_log_stream_forwarder()
-
-        # 检测 PDF 生成依赖（Pango）
         try:
             from .utils.dependency_check import log_dependency_status
             log_dependency_status()
         except Exception as dep_err:
             logger.warning(f"依赖检测失败: {dep_err}")
-
+        logger.info("Report Engine task factory初始化成功")
         return True
-    except Exception as e:
-        logger.exception(f"Report Engine初始化失败: {str(e)}")
+    except Exception as exc:
+        report_agent = None
+        logger.exception(f"Report Engine初始化失败: {exc}")
         return False
 
 
@@ -441,290 +465,239 @@ def check_engines_ready(research_task_id: Optional[str] = None) -> Dict[str, Any
 
 
 def run_report_generation(task: ReportTask, query: str, custom_template: str = ""):
-    """
-    在后台线程中运行报告生成。
+    """使用独立ReportAgent生成一个research task的最终报告。"""
+    research_task_id = task.research_task_id
 
-    包括：检查输入→加载文档→调用ReportAgent→持久化输出→
-    推送阶段性事件。出现错误会自动推送并写状态。
-
-    参数:
-        task: 本次任务对象，内部持有事件队列。
-        query: 报告主题。
-        custom_template: 可选的自定义模板字符串。
-    """
-    global current_task
+    def stream_handler(event_type: str, payload: Dict[str, Any]):
+        task.publish_event(event_type, payload)
+        if event_type == 'progress' and 'progress' in payload:
+            task.update_status("running", payload['progress'])
 
     try:
-        # 在局部闭包内封装推送逻辑，便于传递给ReportAgent
-        def stream_handler(event_type: str, payload: Dict[str, Any]):
-            """所有阶段事件都通过同一个接口分发，保证日志一致。"""
-            task.publish_event(event_type, payload)
-            # 如果事件包含进度信息，同步更新任务进度
-            if event_type == 'progress' and 'progress' in payload:
-                task.update_status("running", payload['progress'])
-
-        task.update_status("running", 5)
-        task.publish_event('stage', {'message': '任务已启动，正在检查输入文件', 'stage': 'prepare'})
-
-        # 检查输入文件
-        check_result = check_engines_ready(task.research_task_id)
-        if not check_result['ready']:
-            task.update_status("error", 0, f"输入文件未准备就绪: {check_result.get('missing_files', [])}")
-            return
-
-        task.publish_event('stage', {
-            'message': '输入文件检查通过，准备载入内容',
-            'stage': 'io_ready',
-            'files': check_result.get('latest_files', {})
-        })
-
-        # 加载输入文件
-        content = report_agent.load_input_files(check_result['latest_files'])
-        content['forum_logs'] = render_forum_log(task.research_task_id)
-        task.publish_event('stage', {
-            'message': '源数据加载完成，启动生成流程',
-            'stage': 'data_loaded',
-            'research_task_id': task.research_task_id,
-        })
-
-        # 生成报告（附带兜底重试，缓解瞬时网络抖动）
-        for attempt in range(1, 3):
-            try:
+        with task_log_context(research_task_id, "report"):
+            with logger.contextualize(report_task_id=task.task_id):
+                task.update_status("running", 5)
                 task.publish_event('stage', {
-                    'message': f'正在调用ReportAgent生成报告（第{attempt}次尝试）',
-                    'stage': 'agent_running',
-                    'attempt': attempt
+                    'message': '任务已启动，正在检查输入文件',
+                    'stage': 'prepare',
+                    'research_task_id': research_task_id,
                 })
-                generation_result = report_agent.generate_report(
-                    query=query,
-                    reports=content['reports'],
-                    forum_logs=content['forum_logs'],
-                    custom_template=custom_template,
-                    save_report=True,
-                    stream_handler=stream_handler,
-                    research_task_id=task.research_task_id,
+
+                check_result = check_engines_ready(research_task_id)
+                if not check_result['ready']:
+                    task.update_status(
+                        "error",
+                        0,
+                        f"输入文件未准备就绪: {check_result.get('missing_files', [])}",
+                    )
+                    return
+
+                task.publish_event('stage', {
+                    'message': '输入文件检查通过，准备载入内容',
+                    'stage': 'io_ready',
+                    'files': check_result.get('latest_files', {}),
+                })
+
+                report_config = _build_task_report_config(research_task_id)
+                agent = create_agent(config=report_config, task_id=research_task_id)
+                content = agent.load_input_files(check_result['latest_files'])
+                content['forum_logs'] = render_forum_log(research_task_id)
+                task.publish_event('stage', {
+                    'message': '源数据加载完成，启动生成流程',
+                    'stage': 'data_loaded',
+                    'research_task_id': research_task_id,
+                })
+
+                generation_result = None
+                for attempt in range(1, 3):
+                    if task.status == "cancelled":
+                        return
+                    try:
+                        task.publish_event('stage', {
+                            'message': f'正在调用ReportAgent生成报告（第{attempt}次尝试）',
+                            'stage': 'agent_running',
+                            'attempt': attempt,
+                        })
+                        generation_result = agent.generate_report(
+                            query=query,
+                            reports=content['reports'],
+                            forum_logs=content['forum_logs'],
+                            custom_template=custom_template,
+                            save_report=True,
+                            stream_handler=stream_handler,
+                        )
+                        break
+                    except ChapterJsonParseError as err:
+                        hint_message = "尝试将Report Engine的API更换为算力更强、上下文更长的LLM"
+                        task.publish_event('warning', {
+                            'message': hint_message,
+                            'stage': 'agent_running',
+                            'attempt': attempt,
+                            'reason': 'chapter_json_parse',
+                            'error': str(err),
+                            'task': task.to_dict(),
+                        })
+                        raise ChapterJsonParseError(hint_message) from err
+                    except Exception as err:
+                        task.publish_event('warning', {
+                            'message': f'ReportAgent执行失败: {err}',
+                            'stage': 'agent_running',
+                            'attempt': attempt,
+                        })
+                        if attempt == 2:
+                            raise
+                        backoff = min(5 * attempt, 15)
+                        task.publish_event('stage', {
+                            'message': f'{backoff} 秒后重试生成任务',
+                            'stage': 'retry_wait',
+                            'wait_seconds': backoff,
+                        })
+                        time.sleep(backoff)
+
+                if task.status == "cancelled":
+                    return
+                if generation_result is None:
+                    raise RuntimeError("ReportAgent未返回生成结果")
+
+                html_report = (
+                    generation_result.get('html_content', '')
+                    if isinstance(generation_result, dict)
+                    else generation_result
                 )
-                break
-            except ChapterJsonParseError as err:
-                hint_message = "尝试将Report Engine的API更换为算力更强、上下文更长的LLM"
-                task.publish_event('warning', {
-                    'message': hint_message,
-                    'stage': 'agent_running',
-                    'attempt': attempt,
-                    'reason': 'chapter_json_parse',
-                    'error': str(err),
+                task.publish_event('stage', {
+                    'message': '报告生成完毕，准备持久化',
+                    'stage': 'persist',
+                })
+
+                task.html_content = html_report
+                if isinstance(generation_result, dict):
+                    task.report_file_path = generation_result.get('report_filepath', '')
+                    task.report_file_relative_path = generation_result.get('report_relative_path', '')
+                    task.report_file_name = generation_result.get('report_filename', '')
+                    task.state_file_path = generation_result.get('state_filepath', '')
+                    task.state_file_relative_path = generation_result.get('state_relative_path', '')
+                    task.ir_file_path = generation_result.get('ir_filepath', '')
+                    task.ir_file_relative_path = generation_result.get('ir_relative_path', '')
+
+                task.publish_event('html_ready', {
+                    'message': 'HTML渲染完成，可刷新预览',
+                    'report_file': task.report_file_relative_path or task.report_file_path,
+                    'state_file': task.state_file_relative_path or task.state_file_path,
                     'task': task.to_dict(),
                 })
-                # 旧逻辑：在JSON解析失败后重启Report Engine
-                # backoff = min(5 * attempt, 15)
-                # task.publish_event('stage', {
-                #     'message': f'{backoff} 秒后重试生成任务',
-                #     'stage': 'retry_wait',
-                #     'wait_seconds': backoff
-                # })
-                # time.sleep(backoff)
-                raise ChapterJsonParseError(hint_message) from err
-            except Exception as err:
-                # 将错误即时推送至前端，方便观察重试策略
-                task.publish_event('warning', {
-                    'message': f'ReportAgent执行失败: {str(err)}',
-                    'stage': 'agent_running',
-                    'attempt': attempt
+                task.update_status("completed", 100)
+                task.publish_event('completed', {
+                    'message': '任务完成',
+                    'duration_seconds': (task.updated_at - task.created_at).total_seconds(),
+                    'report_file': task.report_file_relative_path or task.report_file_path,
+                    'task': task.to_dict(),
                 })
-                if attempt == 2:
-                    raise
-                # 简单的指数退避，防止频繁触发限流（单位秒）
-                backoff = min(5 * attempt, 15)
-                task.publish_event('stage', {
-                    'message': f'{backoff} 秒后重试生成任务',
-                    'stage': 'retry_wait',
-                    'wait_seconds': backoff
-                })
-                time.sleep(backoff)
-
-        if isinstance(generation_result, dict):
-            html_report = generation_result.get('html_content', '')
-        else:
-            html_report = generation_result
-
-        task.publish_event('stage', {'message': '报告生成完毕，准备持久化', 'stage': 'persist'})
-
-        # 保存结果
-        task.html_content = html_report
-        if isinstance(generation_result, dict):
-            task.report_file_path = generation_result.get('report_filepath', '')
-            task.report_file_relative_path = generation_result.get('report_relative_path', '')
-            task.report_file_name = generation_result.get('report_filename', '')
-            task.state_file_path = generation_result.get('state_filepath', '')
-            task.state_file_relative_path = generation_result.get('state_relative_path', '')
-            task.ir_file_path = generation_result.get('ir_filepath', '')
-            task.ir_file_relative_path = generation_result.get('ir_relative_path', '')
-        task.publish_event('html_ready', {
-            'message': 'HTML渲染完成，可刷新预览',
-            'report_file': task.report_file_relative_path or task.report_file_path,
-            'state_file': task.state_file_relative_path or task.state_file_path,
-            'task': task.to_dict(),
-        })
-        task.update_status("completed", 100)
-        task.publish_event('completed', {
-            'message': '任务完成',
-            'duration_seconds': (task.updated_at - task.created_at).total_seconds(),
-            'report_file': task.report_file_relative_path or task.report_file_path,
-            'task': task.to_dict(),
-        })
-
-    except Exception as e:
-        logger.exception(f"报告生成过程中发生错误: {str(e)}")
-        task.update_status("error", 0, str(e))
-        task.publish_event('error', {
-            'message': str(e),
-            'stage': 'failed',
-            'task': task.to_dict(),
-        })
-        # 只在出错时清理任务
-        with task_lock:
-            if current_task and current_task.task_id == task.task_id:
-                current_task = None
+    except Exception as exc:
+        logger.exception(f"报告生成过程中发生错误: {exc}")
+        if task.status != "cancelled":
+            task.update_status("error", 0, str(exc))
+            task.publish_event('error', {
+                'message': str(exc),
+                'stage': 'failed',
+                'task': task.to_dict(),
+            })
 
 
 @report_bp.route('/status', methods=['GET'])
 def get_status():
-    """
-    获取Report Engine状态，包括引擎就绪情况与当前任务信息。
-
-    返回:
-        Response: JSON结构包含initialized/engines_ready/当前任务等。
-    """
+    """只返回指定research task的Report就绪状态与最近任务。"""
     try:
         raw_task_id = request.args.get('task_id') or request.args.get('research_task_id')
         research_task_id = validate_runtime_id(raw_task_id) if raw_task_id else None
         engines_status = check_engines_ready(research_task_id)
-        visible_current = (
-            current_task
-            if current_task and current_task.research_task_id == research_task_id
-            else None
-        )
-
+        visible_current = _latest_report_task_for_research(research_task_id)
         return jsonify({
             'success': True,
             'initialized': report_agent is not None,
             'research_task_id': research_task_id,
-            'engines_ready': engines_status['ready'],
+            'engines_ready': engines_status.get('ready', False),
             'files_found': engines_status.get('files_found', []),
             'missing_files': engines_status.get('missing_files', []),
-            'current_task': visible_current.to_dict() if visible_current else None
+            'current_task': visible_current.to_dict() if visible_current else None,
         })
-    except Exception as e:
-        logger.exception(f"获取Report Engine状态失败: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except Exception as exc:
+        logger.exception(f"获取Report Engine状态失败: {exc}")
+        return jsonify({'success': False, 'error': str(exc)}), 500
 
 
 @report_bp.route('/generate', methods=['POST'])
 def generate_report():
-    """
-    开始生成报告。
-
-    负责排队、创建后台线程、清空日志并返回SSE地址。
-
-    请求体:
-        query: 报告主题（可选）。
-        custom_template: 自定义模板字符串（可选）。
-
-    返回:
-        Response: JSON，包含 task_id 与 SSE stream url。
-    """
-    global current_task
-
+    """为指定research task创建独立、可并发的Report任务。"""
     try:
-        # 检查是否有任务在运行
-        with task_lock:
-            if current_task and current_task.status == "running":
-                return jsonify({
-                    'success': False,
-                    'error': 'Report Engine当前有任务运行，请稍后重试'
-                }), 409
-
-            # 如果有已完成的任务，清理它
-            if current_task and current_task.status in ["completed", "error"]:
-                current_task = None
-
-        # 获取请求参数
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         if not isinstance(data, dict):
-            logger.warning("generate_report 接收到非对象JSON负载，已忽略原始内容")
             data = {}
-        query = data.get('query', '智能舆情分析报告')
-        custom_template = data.get('custom_template', '')
+        query = str(data.get('query') or '智能舆情分析报告')
+        custom_template = str(data.get('custom_template') or '')
         raw_research_task_id = data.get('research_task_id') or data.get('task_id')
         if not raw_research_task_id:
             return jsonify({'success': False, 'error': '缺少research_task_id'}), 400
         research_task_id = validate_runtime_id(str(raw_research_task_id))
+        client_id = data.get('client_id')
+        if client_id:
+            client_id = validate_runtime_id(str(client_id), 'client_id')
+        ensure_task(research_task_id, client_id=client_id, query=query)
 
-        # 清空日志文件
-        clear_report_log()
-
-        # 检查Report Engine是否初始化
         if not report_agent:
-            return jsonify({
-                'success': False,
-                'error': 'Report Engine未初始化'
-            }), 500
+            return jsonify({'success': False, 'error': 'Report Engine未初始化'}), 500
 
-        # 检查输入文件是否准备就绪
         engines_status = check_engines_ready(research_task_id)
         if not engines_status['ready']:
             return jsonify({
                 'success': False,
                 'error': '输入文件未准备就绪',
-                'missing_files': engines_status.get('missing_files', [])
+                'missing_files': engines_status.get('missing_files', []),
             }), 400
 
-        # 创建新任务
-        task_id = f"report_{int(time.time())}"
-        task = ReportTask(query, task_id, custom_template, research_task_id=research_task_id)
+        # research task与report task是两层ID：前者隔离整次研究，后者允许同一研究重跑报告。
+        report_task_id = f"report_{uuid4().hex}"
+        task = ReportTask(
+            query,
+            report_task_id,
+            custom_template,
+            research_task_id=research_task_id,
+        )
+        clear_report_log(research_task_id)
 
         with task_lock:
-            current_task = task
-            tasks_registry[task_id] = task
+            tasks_registry[report_task_id] = task
             _prune_task_history_locked()
 
-        # 通过主动推送pending事件告知前端任务已经排队
-        task.publish_event(
-            'status',
-            {
-                'status': task.status,
-                'progress': task.progress,
-                'message': '任务已排队，等待资源空闲',
-                'task': task.to_dict(),
-            }
-        )
+        task.publish_event('status', {
+            'status': task.status,
+            'progress': task.progress,
+            'message': '任务已排队，等待资源空闲',
+            'task': task.to_dict(),
+        })
 
-        # 在后台线程中运行报告生成
         thread = threading.Thread(
             target=run_report_generation,
             args=(task, query, custom_template),
-            daemon=True
+            daemon=True,
+            name=f"report-{report_task_id[-12:]}",
         )
         thread.start()
 
         return jsonify({
             'success': True,
-            'task_id': task_id,
+            'task_id': report_task_id,
             'research_task_id': research_task_id,
             'message': '报告生成已启动',
             'task': task.to_dict(),
-            'stream_url': f"/api/report/stream/{task_id}"
+            'stream_url': f"/api/report/stream/{report_task_id}",
         })
-
-    except Exception as e:
-        logger.exception(f"开始生成报告失败: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except Exception as exc:
+        logger.exception(f"开始生成报告失败: {exc}")
+        return jsonify({'success': False, 'error': str(exc)}), 500
 
 
 @report_bp.route('/progress/<task_id>', methods=['GET'])
@@ -1011,55 +984,27 @@ def download_report(task_id: str):
 
 @report_bp.route('/cancel/<task_id>', methods=['POST'])
 def cancel_task(task_id: str):
-    """
-    取消报告生成任务。
-
-    参数:
-        task_id: 需要被取消的任务ID。
-
-    返回:
-        Response: JSON，包含取消结果或错误信息。
-    """
-    global current_task
-
+    """取消一个report task，不影响其他research/report任务。"""
     try:
         with task_lock:
-            cancelled = False
-            if current_task and current_task.task_id == task_id:
-                if current_task.status == "running":
-                    current_task.update_status("cancelled", 0, "用户取消任务")
-                    current_task.publish_event('cancelled', {
-                        'message': '任务被用户主动终止',
-                        'task': current_task.to_dict(),
-                    })
-                    cancelled = True
-                current_task = None
             task = tasks_registry.get(task_id)
-            if task and task.status == 'running':
-                task.update_status("cancelled", task.progress, "用户取消任务")
-                task.publish_event('cancelled', {
-                    'message': '任务被用户主动终止',
-                    'task': task.to_dict(),
-                })
-                cancelled = True
+        if not task:
+            return jsonify({'success': False, 'error': '任务不存在'}), 404
+        if task.status in STREAM_TERMINAL_STATUSES:
+            return jsonify({
+                'success': task.status == 'cancelled',
+                'message': '任务已取消' if task.status == 'cancelled' else '任务已结束',
+            }), (200 if task.status == 'cancelled' else 400)
 
-            if cancelled or (task and task.status == 'cancelled'):
-                return jsonify({
-                    'success': True,
-                    'message': '任务已取消'
-                })
-            else:
-                return jsonify({
-                    'success': False,
-                    'error': '任务不存在或无法取消'
-                }), 404
-
-    except Exception as e:
-        logger.exception(f"取消报告生成任务失败: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        task.update_status("cancelled", task.progress, "用户取消任务")
+        task.publish_event('cancelled', {
+            'message': '任务被用户主动终止',
+            'task': task.to_dict(),
+        })
+        return jsonify({'success': True, 'message': '任务已取消'})
+    except Exception as exc:
+        logger.exception(f"取消报告生成任务失败: {exc}")
+        return jsonify({'success': False, 'error': str(exc)}), 500
 
 
 @report_bp.route('/templates', methods=['GET'])
@@ -1132,120 +1077,66 @@ def internal_error(error):
     }), 500
 
 
-def clear_report_log():
-    """
-    清空report.log文件，方便新任务只查看本次运行日志。
-
-    返回:
-        None
-    """
-    try:
-        log_file = settings.LOG_FILE
-
-        # 【修复】使用truncate而非重新打开，避免与logger的文件句柄冲突
-        # 追加模式打开，然后truncate，保持文件句柄有效
-        with open(log_file, 'r+', encoding='utf-8') as f:
-            f.truncate(0)  # 清空文件内容但不关闭文件
-            f.flush()      # 立即刷新
-
-        logger.info(f"已清空日志文件: {log_file}")
-    except FileNotFoundError:
-        # 文件不存在，创建空文件
-        try:
-            with open(log_file, 'w', encoding='utf-8') as f:
-                f.write('')
-            logger.info(f"创建日志文件: {log_file}")
-        except Exception as e:
-            logger.exception(f"创建日志文件失败: {str(e)}")
-    except Exception as e:
-        logger.exception(f"清空日志文件失败: {str(e)}")
+def clear_report_log(research_task_id: str):
+    """仅清空指定research task的Report日志。"""
+    research_task_id = validate_runtime_id(research_task_id)
+    log_file = task_log_path(research_task_id, "report")
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("", encoding="utf-8")
 
 
 @report_bp.route('/log', methods=['GET'])
 def get_report_log():
-    """
-    获取report.log内容，并按行去除空白返回。
-
-    【修复】优化大文件读取，添加错误处理和文件锁
-
-    返回:
-        Response: JSON，包含最新日志行数组。
-    """
+    """读取指定research task的Report日志。"""
     try:
-        log_file = settings.LOG_FILE
-
-        if not os.path.exists(log_file):
-            return jsonify({
-                'success': True,
-                'log_lines': []
-            })
-
-        # 【修复】检查文件大小，避免读取过大文件导致内存问题
-        file_size = os.path.getsize(log_file)
-        max_size = 10 * 1024 * 1024  # 10MB限制
-
+        raw_task_id = request.args.get('task_id') or request.args.get('research_task_id')
+        if not raw_task_id:
+            return jsonify({'success': False, 'error': '缺少research_task_id'}), 400
+        research_task_id = validate_runtime_id(str(raw_task_id))
+        log_file = task_log_path(research_task_id, "report")
+        if not log_file.exists():
+            return jsonify({'success': True, 'research_task_id': research_task_id, 'log_lines': []})
+        max_size = 10 * 1024 * 1024
+        file_size = log_file.stat().st_size
         if file_size > max_size:
-            # 文件过大，只读取最后10MB
-            with open(log_file, 'rb') as f:
-                f.seek(-max_size, 2)  # 从文件末尾往前10MB
-                # 跳过可能不完整的第一行
-                f.readline()
-                content = f.read().decode('utf-8', errors='replace')
-            lines = content.splitlines()
-            logger.warning(f"日志文件过大 ({file_size} bytes)，仅返回最后 {max_size} bytes")
+            with open(log_file, 'rb') as stream:
+                stream.seek(-max_size, 2)
+                stream.readline()
+                lines = stream.read().decode('utf-8', errors='replace').splitlines()
         else:
-            # 正常大小，完整读取
-            with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
-                lines = f.readlines()
-
-        # 清理行尾的换行符和空行
-        log_lines = [line.rstrip('\n\r') for line in lines if line.strip()]
-
+            lines = log_file.read_text(encoding='utf-8', errors='replace').splitlines()
         return jsonify({
             'success': True,
-            'log_lines': log_lines
+            'research_task_id': research_task_id,
+            'log_lines': [line.rstrip('\n\r') for line in lines if line.strip()],
         })
-
-    except PermissionError as e:
-        logger.error(f"读取日志权限不足: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': '读取日志权限不足'
-        }), 403
-    except UnicodeDecodeError as e:
-        logger.error(f"日志文件编码错误: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': '日志文件编码错误'
-        }), 500
-    except Exception as e:
-        logger.exception(f"读取日志失败: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': f'读取日志失败: {str(e)}'
-        }), 500
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except Exception as exc:
+        logger.exception(f"读取Report日志失败: {exc}")
+        return jsonify({'success': False, 'error': f'读取日志失败: {exc}'}), 500
 
 
 @report_bp.route('/log/clear', methods=['POST'])
 def clear_log():
-    """
-    手动清空日志，提供REST入口供前端一键重置。
-
-    返回:
-        Response: JSON，标记是否清理成功。
-    """
+    """手动清空指定research task的Report日志。"""
+    data = request.get_json(silent=True) or {}
+    raw_task_id = data.get('research_task_id') or data.get('task_id')
+    if not raw_task_id:
+        return jsonify({'success': False, 'error': '缺少research_task_id'}), 400
     try:
-        clear_report_log()
+        research_task_id = validate_runtime_id(str(raw_task_id))
+        clear_report_log(research_task_id)
         return jsonify({
             'success': True,
-            'message': '日志已清空'
+            'research_task_id': research_task_id,
+            'message': '日志已清空',
         })
-    except Exception as e:
-        logger.exception(f"清空日志失败: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': f'清空日志失败: {str(e)}'
-        }), 500
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except Exception as exc:
+        logger.exception(f"清空日志失败: {exc}")
+        return jsonify({'success': False, 'error': f'清空日志失败: {exc}'}), 500
 
 
 @report_bp.route('/export/md/<task_id>', methods=['GET'])
@@ -1289,7 +1180,7 @@ def export_markdown(task_id: str):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = f"report_{safe_topic}_{timestamp}.md"
 
-        output_dir = Path(settings.OUTPUT_DIR)
+        output_dir = task_output_dir(task.research_task_id, "report")
         output_dir.mkdir(parents=True, exist_ok=True)
         md_path = output_dir / filename
         md_path.write_text(markdown_text, encoding='utf-8')
