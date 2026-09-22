@@ -114,7 +114,7 @@ def claim_engine_run(
     """Atomically claim one engine execution for a research task.
 
     Returns (token, "claimed") for the single caller allowed to execute,
-    otherwise (None, "running") or (None, "completed"). This makes
+    otherwise (None, "running"), (None, "completed") or (None, "failed"). This makes
     opening the same task from a second browser/device a subscription action
     instead of accidentally launching duplicate research.
     """
@@ -123,10 +123,8 @@ def claim_engine_run(
     if done_path.exists():
         return None, "completed"
     if failed_path.exists():
-        try:
-            failed_path.unlink()
-        except OSError:
-            pass
+        # 历史页面打开失败task时必须保持失败状态，不能把“查看历史”变成隐式重试。
+        return None, "failed"
 
     if lock_path.exists():
         try:
