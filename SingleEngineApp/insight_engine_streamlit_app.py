@@ -32,6 +32,7 @@ from config import settings
 from utils.github_issues import error_with_issue_link
 from utils.task_runtime import (
     claim_engine_run,
+    engine_run_status,
     ensure_task,
     finish_engine_run,
     latest_task_report,
@@ -59,6 +60,7 @@ def main():
         query_params = st.query_params
         auto_query = query_params.get('query', '')
         auto_search = query_params.get('auto_search', 'false').lower() == 'true'
+        view_only = query_params.get('view_only', 'false').lower() == 'true'
         auto_task_id = query_params.get('task_id', '')
         auto_client_id = query_params.get('client_id', '')
     except AttributeError:
@@ -66,6 +68,7 @@ def main():
         query_params = st.experimental_get_query_params()
         auto_query = query_params.get('query', [''])[0]
         auto_search = query_params.get('auto_search', ['false'])[0].lower() == 'true'
+        view_only = query_params.get('view_only', ['false'])[0].lower() == 'true'
         auto_task_id = query_params.get('task_id', [''])[0]
         auto_client_id = query_params.get('client_id', [''])[0]
 
@@ -97,6 +100,26 @@ def main():
     task_id = (auto_task_id or '').strip() or new_task_id()
     client_id = (auto_client_id or '').strip() or None
     execution_key = f"auto_search_executed:{task_id}"
+
+    # 历史task只读恢复：绝不claim运行锁，也绝不重新执行Agent。
+    if view_only and auto_query:
+        status = engine_run_status(task_id, "insight")
+        report_path = latest_task_report(task_id, "insight")
+        if report_path and report_path.exists():
+            if status == "failed":
+                st.warning("Insight Agent上次运行失败，下面显示失败前已保存的结果。")
+            elif status == "running":
+                st.info("Insight Agent仍在运行，下面显示当前已保存的结果。")
+            else:
+                st.info("Insight Agent历史结果")
+            st.markdown(report_path.read_text(encoding="utf-8"))
+        elif status == "running":
+            st.info("Insight Agent正在运行，可在主界面实时日志中查看进度。")
+        elif status == "failed":
+            st.error("Insight Agent上次运行失败，暂无可恢复的报告。")
+        else:
+            st.info("Insight Agent暂无已保存结果。")
+        return
 
     if auto_search and auto_query and execution_key not in st.session_state:
         ensure_task(task_id, client_id=client_id, query=query)
