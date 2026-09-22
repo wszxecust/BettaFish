@@ -31,6 +31,8 @@ except ImportError:
     logger.warning("警告: 无法导入forum_reader模块，将跳过HOST发言读取功能")
 
 
+from ForumEngine.task_store import publish_agent_speech
+
 class FirstSummaryNode(StateMutationNode):
     """根据搜索结果生成段落首次总结的节点"""
     
