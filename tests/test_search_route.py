@@ -152,7 +152,11 @@ def test_search_with_only_forum_returns_no_engine_error(root_app, monkeypatch):
     payload = response.get_json()
     assert payload["success"] is False
     assert payload["task_id"] == "task_forum_only"
-    assert payload["results"] == {}
+    assert payload["results"] == {
+        "insight": {"success": False, "message": "应用未运行"},
+        "media": {"success": False, "message": "应用未运行"},
+        "query": {"success": False, "message": "应用未运行"},
+    }
 
 
 def test_output_requires_task_id(root_app):
