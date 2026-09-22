@@ -654,7 +654,9 @@ def generate_report():
                 'missing_files': engines_status.get('missing_files', []),
             }), 400
 
-        # research task与report task是两层ID：前者隔离整次研究，后者允许同一研究重跑报告。
+        # research task与report task是两层ID：前者隔离整次研究，后者允许完成后重跑报告。
+        # 同一research task同一时刻只允许一个Report任务，避免两个Report实例同时
+        # 改写同一task输出目录；不同research task仍可完全并发。
         report_task_id = f"report_{uuid4().hex}"
         task = ReportTask(
             query,
@@ -662,9 +664,25 @@ def generate_report():
             custom_template,
             research_task_id=research_task_id,
         )
-        clear_report_log(research_task_id)
 
         with task_lock:
+            active_same_research = next(
+                (
+                    existing
+                    for existing in tasks_registry.values()
+                    if existing.research_task_id == research_task_id
+                    and existing.status in ("pending", "running")
+                ),
+                None,
+            )
+            if active_same_research:
+                return jsonify({
+                    'success': False,
+                    'error': '该研究任务已有Report任务正在运行',
+                    'current_task': active_same_research.to_dict(),
+                }), 409
+
+            clear_report_log(research_task_id)
             tasks_registry[report_task_id] = task
             _prune_task_history_locked()
 
