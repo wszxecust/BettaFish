@@ -98,7 +98,12 @@ def _engine_run_paths(task_id: str, engine: str) -> tuple[Path, Path, Path]:
         raise ValueError(f"未知运行组件: {engine}")
     directory = task_runs_dir(task_id)
     directory.mkdir(parents=True, exist_ok=True)
-    return (\n        directory / f"{engine}.lock",\n        directory / f"{engine}.done",\n        directory / f"{engine}.failed",\n    )\n
+    return (
+        directory / f"{engine}.lock",
+        directory / f"{engine}.done",
+        directory / f"{engine}.failed",
+    )
+
 
 def claim_engine_run(
     task_id: str,
@@ -114,7 +119,15 @@ def claim_engine_run(
     instead of accidentally launching duplicate research.
     """
     task_id = ensure_task(task_id)
-    lock_path, done_path, failed_path = _engine_run_paths(task_id, engine)\n    if done_path.exists():\n        return None, "completed"\n    if failed_path.exists():\n        try:\n            failed_path.unlink()\n        except OSError:\n            pass\n
+    lock_path, done_path, failed_path = _engine_run_paths(task_id, engine)
+    if done_path.exists():
+        return None, "completed"
+    if failed_path.exists():
+        try:
+            failed_path.unlink()
+        except OSError:
+            pass
+
     if lock_path.exists():
         try:
             age = time.time() - lock_path.stat().st_mtime
@@ -170,7 +183,9 @@ def finish_engine_run(
 ) -> None:
     """Release a claimed engine run and persist completion only on success."""
     task_id = validate_runtime_id(task_id)
-    lock_path, done_path, failed_path = _engine_run_paths(task_id, engine)\n    try:\n        current = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock_path, done_path, failed_path = _engine_run_paths(task_id, engine)
+    try:
+        current = json.loads(lock_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return
     if current.get("token") != token:
