@@ -151,6 +151,7 @@ def execute_research(query: str, config: Settings, task_id: str):
     """保证同一task的Insight Agent只执行一次；其他设备只订阅/查看。"""
     run_token, run_status = claim_engine_run(task_id, "insight")
     if run_status == "running":
+        st.session_state.pop(f"auto_search_executed:{task_id}", None)
         st.info("该任务的Insight Agent已在其他页面运行，本页面不会重复启动。")
         return False
     if run_status == "completed":
@@ -172,6 +173,8 @@ def execute_research(query: str, config: Settings, task_id: str):
             run_token,
             success=success,
         )
+        if not success:
+            st.session_state.pop(f"auto_search_executed:{task_id}", None)
 
 
 def _execute_research(query: str, config: Settings, task_id: str):
