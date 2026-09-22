@@ -464,7 +464,7 @@ class DeepSearchAgent:
         logger.info(f"状态已保存到 {filepath}")
 
 
-def create_agent() -> DeepSearchAgent:
+def create_agent(task_id: Optional[str] = None) -> DeepSearchAgent:
     """
     创建Deep Search Agent实例的便捷函数
     
