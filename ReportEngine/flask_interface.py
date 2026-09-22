@@ -38,7 +38,6 @@ report_bp = Blueprint('report_engine', __name__)
 
 # 全局变量
 report_agent = None
-current_task = None
 task_lock = threading.Lock()
 
 # ====== 流式推送与任务历史管理 ======
@@ -212,8 +211,6 @@ def _get_task(task_id: str) -> Optional['ReportTask']:
         ReportTask | None: 命中时返回任务实例，否则为None。
     """
     with task_lock:
-        if current_task and current_task.task_id == task_id:
-            return current_task
         return tasks_registry.get(task_id)
 
 
@@ -525,6 +522,7 @@ def run_report_generation(task: ReportTask, query: str, custom_template: str = "
                             custom_template=custom_template,
                             save_report=True,
                             stream_handler=stream_handler,
+                            research_task_id=research_task_id,
                         )
                         break
                     except ChapterJsonParseError as err:
