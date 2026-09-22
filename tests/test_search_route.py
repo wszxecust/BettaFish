@@ -67,6 +67,7 @@ def root_app(monkeypatch, tmp_path):
     socketio_module.SocketIO = DummySocketIO
     socketio_module.emit = lambda *args, **kwargs: None
     socketio_module.join_room = lambda *args, **kwargs: None
+    socketio_module.leave_room = lambda *args, **kwargs: None
 
     monkeypatch.setitem(sys.modules, "MindSpider", mindspider_package)
     monkeypatch.setitem(sys.modules, "MindSpider.main", mindspider_main)
@@ -183,3 +184,66 @@ def test_task_output_endpoint_never_reads_other_task(root_app):
     assert response.status_code == 200
     assert payload["output"] == ["A-only"]
     assert "B-only" not in payload["output"]
+
+
+
+def test_task_history_is_scoped_to_browser_workspace(root_app):
+    module, client, _ = root_app
+    module.ensure_task(
+        "task_workspace_a",
+        client_id="client_a",
+        workspace_id="workspace_a",
+        query="A任务",
+    )
+    module.ensure_task(
+        "task_workspace_b",
+        client_id="client_b",
+        workspace_id="workspace_b",
+        query="B任务",
+    )
+
+    response = client.get("/api/tasks?workspace_id=workspace_a")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert [item["task_id"] for item in payload["tasks"]] == ["task_workspace_a"]
+    assert payload["tasks"][0]["query"] == "A任务"
+
+
+def test_shared_task_can_be_attached_to_second_workspace(root_app):
+    module, client, _ = root_app
+    module.ensure_task(
+        "task_share_link",
+        client_id="client_desktop",
+        workspace_id="workspace_desktop",
+        query="跨设备任务",
+    )
+
+    hidden = client.get(
+        "/api/tasks/task_share_link?workspace_id=workspace_phone"
+    )
+    assert hidden.status_code == 404
+
+    attach = client.post(
+        "/api/tasks",
+        json={
+            "task_id": "task_share_link",
+            "client_id": "client_phone",
+            "workspace_id": "workspace_phone",
+        },
+    )
+    assert attach.status_code == 200
+
+    visible = client.get(
+        "/api/tasks/task_share_link?workspace_id=workspace_phone"
+    )
+    assert visible.status_code == 200
+    assert visible.get_json()["task"]["query"] == "跨设备任务"
+
+
+def test_index_injects_sidebar_and_task_bootstrap(root_app):
+    _, client, _ = root_app
+    response = client.get("/")
+    assert response.status_code == 200
+    html = response.get_data(as_text=True)
+    assert '/static/task_isolation.js' in html
+    assert '/static/task_sidebar.js' in html
