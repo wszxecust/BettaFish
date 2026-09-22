@@ -56,18 +56,49 @@ def task_clients_dir(task_id: str) -> Path:
     return task_dir(task_id) / "clients"
 
 
+def task_workspaces_dir(task_id: str) -> Path:
+    return task_dir(task_id) / "workspaces"
+
+
+def register_task_workspace(task_id: str, workspace_id: str) -> str:
+    task_id = validate_runtime_id(task_id)
+    workspace_id = validate_runtime_id(workspace_id, "workspace_id")
+    directory = task_workspaces_dir(task_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / workspace_id).touch(exist_ok=True)
+    return workspace_id
+
+
+def list_task_workspaces(task_id: str) -> list[str]:
+    directory = task_workspaces_dir(task_id)
+    if not directory.exists():
+        return []
+    result = []
+    for entry in directory.iterdir():
+        if entry.is_file() and _ID_RE.fullmatch(entry.name):
+            result.append(entry.name)
+    return sorted(set(result))
+
+
+def workspace_has_task(task_id: str, workspace_id: str) -> bool:
+    try:
+        workspace_id = validate_runtime_id(workspace_id, "workspace_id")
+    except ValueError:
+        return False
+    return (task_workspaces_dir(task_id) / workspace_id).is_file()
+
+
 def task_runs_dir(task_id: str) -> Path:
     return task_dir(task_id) / "runs"
 
 
-def _engine_run_paths(task_id: str, engine: str) -> tuple[Path, Path]:
+def _engine_run_paths(task_id: str, engine: str) -> tuple[Path, Path, Path]:
     engine = engine.lower().strip()
     if engine not in _ENGINE_NAMES:
         raise ValueError(f"未知运行组件: {engine}")
     directory = task_runs_dir(task_id)
     directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"{engine}.lock", directory / f"{engine}.done"
-
+    return (\n        directory / f"{engine}.lock",\n        directory / f"{engine}.done",\n        directory / f"{engine}.failed",\n    )\n
 
 def claim_engine_run(
     task_id: str,
@@ -83,10 +114,7 @@ def claim_engine_run(
     instead of accidentally launching duplicate research.
     """
     task_id = ensure_task(task_id)
-    lock_path, done_path = _engine_run_paths(task_id, engine)
-    if done_path.exists():
-        return None, "completed"
-
+    lock_path, done_path, failed_path = _engine_run_paths(task_id, engine)\n    if done_path.exists():\n        return None, "completed"\n    if failed_path.exists():\n        try:\n            failed_path.unlink()\n        except OSError:\n            pass\n
     if lock_path.exists():
         try:
             age = time.time() - lock_path.stat().st_mtime
@@ -142,28 +170,33 @@ def finish_engine_run(
 ) -> None:
     """Release a claimed engine run and persist completion only on success."""
     task_id = validate_runtime_id(task_id)
-    lock_path, done_path = _engine_run_paths(task_id, engine)
-    try:
-        current = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock_path, done_path, failed_path = _engine_run_paths(task_id, engine)\n    try:\n        current = json.loads(lock_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return
     if current.get("token") != token:
         return
 
-    if success:
-        tmp = done_path.with_name(f".{done_path.name}.{uuid4().hex}.tmp")
-        tmp.write_text(
-            json.dumps(
-                {
-                    "task_id": task_id,
-                    "engine": engine,
-                    "completed_at": time.time(),
-                },
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-        os.replace(tmp, done_path)
+    marker_path = done_path if success else failed_path
+    other_marker = failed_path if success else done_path
+    try:
+        other_marker.unlink()
+    except FileNotFoundError:
+        pass
+
+    tmp = marker_path.with_name(f".{marker_path.name}.{uuid4().hex}.tmp")
+    tmp.write_text(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "engine": engine,
+                "status": "completed" if success else "failed",
+                "finished_at": time.time(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    os.replace(tmp, marker_path)
 
     try:
         lock_path.unlink()
@@ -172,11 +205,13 @@ def finish_engine_run(
 
 
 def engine_run_status(task_id: str, engine: str) -> str:
-    lock_path, done_path = _engine_run_paths(task_id, engine)
+    lock_path, done_path, failed_path = _engine_run_paths(task_id, engine)
     if done_path.exists():
         return "completed"
     if lock_path.exists():
         return "running"
+    if failed_path.exists():
+        return "failed"
     return "idle"
 
 def register_task_client(task_id: str, client_id: str) -> str:
@@ -233,20 +268,26 @@ def ensure_task(
     task_id: str,
     *,
     client_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
     query: Optional[str] = None,
 ) -> str:
     """Create task directories and merge non-empty metadata atomically."""
     task_id = validate_runtime_id(task_id)
     if client_id:
         client_id = validate_runtime_id(client_id, "client_id")
+    if workspace_id:
+        workspace_id = validate_runtime_id(workspace_id, "workspace_id")
 
     root = task_dir(task_id)
     task_logs_dir(task_id).mkdir(parents=True, exist_ok=True)
     task_outputs_dir(task_id).mkdir(parents=True, exist_ok=True)
     task_clients_dir(task_id).mkdir(parents=True, exist_ok=True)
+    task_workspaces_dir(task_id).mkdir(parents=True, exist_ok=True)
     task_runs_dir(task_id).mkdir(parents=True, exist_ok=True)
     if client_id:
         register_task_client(task_id, client_id)
+    if workspace_id:
+        register_task_workspace(task_id, workspace_id)
 
     metadata_path = task_metadata_path(task_id)
     metadata: Dict[str, str] = {}
@@ -258,9 +299,14 @@ def ensure_task(
         except Exception:
             logger.warning(f"任务元数据损坏，将重建: {metadata_path}")
 
+    now = time.time()
     metadata["task_id"] = task_id
+    metadata.setdefault("created_at", now)
+    metadata["updated_at"] = now
     if client_id:
         metadata["client_id"] = client_id
+    if workspace_id:
+        metadata["workspace_id"] = workspace_id
     if query is not None and str(query).strip():
         metadata["query"] = str(query)
 
@@ -293,6 +339,45 @@ def list_task_ids() -> list[str]:
         if entry.is_dir() and _ID_RE.fullmatch(entry.name):
             task_ids.append(entry.name)
     return task_ids
+
+
+def task_engine_statuses(task_id: str) -> Dict[str, str]:
+    return {
+        engine: engine_run_status(task_id, engine)
+        for engine in ("insight", "media", "query")
+    }
+
+
+def task_overall_status(task_id: str) -> str:
+    statuses = list(task_engine_statuses(task_id).values())
+    if any(status == "running" for status in statuses):
+        return "running"
+    if any(status == "failed" for status in statuses):
+        return "failed"
+    if statuses and all(status == "completed" for status in statuses):
+        return "completed"
+    # 新建/排队/部分完成但尚未全部结束，在侧边栏都按“运行中”展示。
+    return "running"
+
+
+def task_summary(task_id: str) -> Dict[str, object]:
+    metadata = read_task_metadata(task_id)
+    root = task_dir(task_id)
+    try:
+        dir_mtime = root.stat().st_mtime
+    except OSError:
+        dir_mtime = 0.0
+    created_at = float(metadata.get("created_at") or dir_mtime or time.time())
+    updated_at = float(metadata.get("updated_at") or dir_mtime or created_at)
+    engines = task_engine_statuses(task_id)
+    return {
+        "task_id": task_id,
+        "query": str(metadata.get("query") or ""),
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "status": task_overall_status(task_id),
+        "engines": engines,
+    }
 
 
 def latest_task_report(task_id: str, engine: str) -> Optional[Path]:
