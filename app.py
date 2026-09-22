@@ -919,208 +919,206 @@ def stop_app(app_name):
     success, message = stop_streamlit_app(app_name)
     return jsonify({'success': success, 'message': message})
 
+def _task_id_from_request(payload=None):
+    payload = payload if isinstance(payload, dict) else {}
+    raw = (
+        payload.get('task_id')
+        or payload.get('research_task_id')
+        or request.args.get('task_id')
+        or request.headers.get('X-BettaFish-Task-ID')
+    )
+    if not raw:
+        return None
+    return validate_runtime_id(str(raw))
+
+
+@app.route('/api/tasks', methods=['POST'])
+def create_research_task():
+    """创建/确认一个研究task及其浏览器tab归属。"""
+    data = request.get_json(silent=True) or {}
+    try:
+        task_id = validate_runtime_id(str(data.get('task_id') or new_task_id()))
+        client_id = validate_runtime_id(
+            str(data.get('client_id') or new_client_id()),
+            'client_id',
+        )
+        query = str(data.get('query') or '')
+        ensure_task(task_id, client_id=client_id, query=query)
+        initialize_task_forum(task_id)
+        return jsonify({
+            'success': True,
+            'task_id': task_id,
+            'client_id': client_id,
+            'query': query,
+        })
+    except ValueError as exc:
+        return jsonify({'success': False, 'message': str(exc)}), 400
+
+
 @app.route('/api/output/<app_name>')
 def get_output(app_name):
-    """获取应用输出"""
+    """只返回指定task的输出，禁止读取共享Agent日志。"""
     if app_name not in processes:
-        return jsonify({'success': False, 'message': '未知应用'})
-    
-    # 特殊处理Forum Engine
-    if app_name == 'forum':
-        try:
-            forum_log_content = read_log_from_file('forum')
-            return jsonify({
-                'success': True,
-                'output': forum_log_content,
-                'total_lines': len(forum_log_content)
-            })
-        except Exception as e:
-            return jsonify({'success': False, 'message': f'读取forum日志失败: {str(e)}'})
-    
-    # 从文件读取完整日志
-    output_lines = read_log_from_file(app_name)
-    
+        return jsonify({'success': False, 'message': '未知应用'}), 404
+    try:
+        task_id = _task_id_from_request()
+    except ValueError as exc:
+        return jsonify({'success': False, 'message': str(exc)}), 400
+    if not task_id:
+        return jsonify({'success': False, 'message': '缺少task_id'}), 400
+
+    output_lines = read_log_from_file(app_name, task_id=task_id)
     return jsonify({
         'success': True,
-        'output': output_lines
+        'task_id': task_id,
+        'output': output_lines,
+        'total_lines': len(output_lines),
     })
+
 
 @app.route('/api/test_log/<app_name>')
 def test_log(app_name):
-    """测试日志写入功能"""
+    """向指定task写入测试日志。"""
     if app_name not in processes:
-        return jsonify({'success': False, 'message': '未知应用'})
-    
-    # 写入测试消息
+        return jsonify({'success': False, 'message': '未知应用'}), 404
+    try:
+        task_id = _task_id_from_request()
+    except ValueError as exc:
+        return jsonify({'success': False, 'message': str(exc)}), 400
+    if not task_id:
+        return jsonify({'success': False, 'message': '缺少task_id'}), 400
+
     test_msg = f"[{datetime.now().strftime('%H:%M:%S')}] 测试日志消息 - {datetime.now()}"
-    write_log_to_file(app_name, test_msg)
-    
-    # 通过Socket.IO发送
-    socketio.emit('console_output', {
-        'app': app_name,
-        'line': test_msg
-    })
-    
-    return jsonify({
-        'success': True,
-        'message': f'测试消息已写入 {app_name} 日志'
-    })
+    write_log_to_file(app_name, test_msg, task_id=task_id)
+    room = _task_client_room(task_id)
+    if room:
+        socketio.emit(
+            'console_output',
+            {'app': app_name, 'line': test_msg, 'task_id': task_id},
+            room=room,
+        )
+    return jsonify({'success': True, 'task_id': task_id, 'message': '测试消息已写入task日志'})
+
 
 @app.route('/api/forum/start')
 def start_forum_monitoring_api():
-    """手动启动ForumEngine论坛"""
-    try:
-        from ForumEngine.monitor import start_forum_monitoring
-        success = start_forum_monitoring()
-        if success:
-            return jsonify({'success': True, 'message': 'ForumEngine论坛已启动'})
-        else:
-            return jsonify({'success': False, 'message': 'ForumEngine论坛启动失败'})
-    except Exception as e:
-        return jsonify({'success': False, 'message': f'启动论坛失败: {str(e)}'})
+    start_forum_engine()
+    processes['forum']['status'] = 'running'
+    return jsonify({'success': True, 'message': 'task-scoped Forum服务已就绪'})
+
 
 @app.route('/api/forum/stop')
 def stop_forum_monitoring_api():
-    """手动停止ForumEngine论坛"""
-    try:
-        from ForumEngine.monitor import stop_forum_monitoring
-        stop_forum_monitoring()
-        return jsonify({'success': True, 'message': 'ForumEngine论坛已停止'})
-    except Exception as e:
-        return jsonify({'success': False, 'message': f'停止论坛失败: {str(e)}'})
+    stop_forum_engine()
+    processes['forum']['status'] = 'stopped'
+    return jsonify({'success': True, 'message': 'Forum服务已标记停止'})
+
 
 @app.route('/api/forum/log')
 def get_forum_log():
-    """获取ForumEngine的forum.log内容"""
+    """返回指定task的完整Forum事件历史。"""
     try:
-        forum_log_file = LOG_DIR / "forum.log"
-        if not forum_log_file.exists():
-            return jsonify({
-                'success': True,
-                'log_lines': [],
-                'parsed_messages': [],
-                'total_lines': 0
-            })
-        
-        with open(forum_log_file, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
-            lines = [line.rstrip('\n\r') for line in lines if line.strip()]
-        
-        # 解析每一行日志并提取对话信息
-        parsed_messages = []
-        for line in lines:
-            parsed_message = parse_forum_log_line(line)
-            if parsed_message:
-                parsed_messages.append(parsed_message)
-        
+        task_id = _task_id_from_request()
+    except ValueError as exc:
+        return jsonify({'success': False, 'message': str(exc)}), 400
+    if not task_id:
+        return jsonify({'success': False, 'message': '缺少task_id'}), 400
+
+    try:
+        events = list_events(task_id, limit=5000)
+        lines = [line for line in (_forum_event_to_log_line(e) for e in events) if line]
+        messages = [msg for msg in (_forum_event_to_message(e) for e in events) if msg]
         return jsonify({
             'success': True,
+            'task_id': task_id,
             'log_lines': lines,
-            'parsed_messages': parsed_messages,
-            'total_lines': len(lines)
+            'parsed_messages': messages,
+            'total_lines': len(lines),
+            'position': int(events[-1]['id']) if events else 0,
         })
-    except Exception as e:
-        return jsonify({'success': False, 'message': f'读取forum.log失败: {str(e)}'})
+    except Exception as exc:
+        logger.exception(f"task={task_id} 读取Forum历史失败")
+        return jsonify({'success': False, 'message': str(exc)}), 500
+
 
 @app.route('/api/forum/log/history', methods=['POST'])
 def get_forum_log_history():
-    """获取Forum历史日志（支持从指定位置开始）"""
+    """按Forum事件ID增量读取指定task；position不再是全局文件字节偏移。"""
+    data = request.get_json(silent=True) or {}
     try:
-        data = request.get_json()
-        start_position = data.get('position', 0)  # 客户端上次接收的位置
-        max_lines = data.get('max_lines', 1000)   # 最多返回的行数
+        task_id = _task_id_from_request(data)
+    except ValueError as exc:
+        return jsonify({'success': False, 'message': str(exc)}), 400
+    if not task_id:
+        return jsonify({'success': False, 'message': '缺少task_id'}), 400
 
-        forum_log_file = LOG_DIR / "forum.log"
-        if not forum_log_file.exists():
-            return jsonify({
-                'success': True,
-                'log_lines': [],
-                'position': 0,
-                'has_more': False
-            })
+    start_position = max(0, int(data.get('position', 0) or 0))
+    max_lines = max(1, min(int(data.get('max_lines', 1000) or 1000), 5000))
+    events = list_events(task_id, after_id=start_position, limit=max_lines + 1)
+    has_more = len(events) > max_lines
+    returned = events[:max_lines]
+    lines = [line for line in (_forum_event_to_log_line(e) for e in returned) if line]
+    position = int(returned[-1]['id']) if returned else start_position
+    return jsonify({
+        'success': True,
+        'task_id': task_id,
+        'log_lines': lines,
+        'position': position,
+        'has_more': has_more,
+    })
 
-        with open(forum_log_file, 'r', encoding='utf-8', errors='ignore') as f:
-            # 从指定位置开始读取
-            f.seek(start_position)
-            lines = []
-            line_count = 0
-
-            for line in f:
-                if line_count >= max_lines:
-                    break
-                line = line.rstrip('\n\r')
-                if line.strip():
-                    # 添加时间戳
-                    timestamp = datetime.now().strftime('%H:%M:%S')
-                    formatted_line = f"[{timestamp}] {line}"
-                    lines.append(formatted_line)
-                    line_count += 1
-
-            # 记录当前位置
-            current_position = f.tell()
-
-            # 检查是否还有更多内容
-            f.seek(0, 2)  # 移到文件末尾
-            end_position = f.tell()
-            has_more = current_position < end_position
-
-        return jsonify({
-            'success': True,
-            'log_lines': lines,
-            'position': current_position,
-            'has_more': has_more
-        })
-    except Exception as e:
-        return jsonify({'success': False, 'message': f'读取forum历史失败: {str(e)}'})
 
 @app.route('/api/search', methods=['POST'])
 def search():
-    """统一搜索接口"""
-    data = request.get_json()
-    query = data.get('query', '').strip()
-    
+    """统一搜索接口：生成/沿用task_id并把它传给每个子引擎。"""
+    data = request.get_json(silent=True) or {}
+    query = str(data.get('query', '')).strip()
     if not query:
-        return jsonify({'success': False, 'message': '搜索查询不能为空'})
-    
-    # ForumEngine论坛已经在后台运行，会自动检测搜索活动
-    # logger.info("ForumEngine: 搜索请求已收到，论坛将自动检测日志变化")
-    
-    # 检查哪些应用正在运行
+        return jsonify({'success': False, 'message': '搜索查询不能为空'}), 400
+
+    try:
+        task_id = validate_runtime_id(str(data.get('task_id') or new_task_id()))
+        client_id = validate_runtime_id(
+            str(data.get('client_id') or new_client_id()),
+            'client_id',
+        )
+    except ValueError as exc:
+        return jsonify({'success': False, 'message': str(exc)}), 400
+
+    ensure_task(task_id, client_id=client_id, query=query)
+    initialize_task_forum(task_id)
+
     check_app_status()
     running_apps = [name for name, info in processes.items() if info['status'] == 'running']
-    
     if not running_apps:
-        return jsonify({'success': False, 'message': '没有运行中的应用'})
-    
-    # 向运行中的应用发送搜索请求
+        return jsonify({'success': False, 'message': '没有运行中的应用'}), 400
+
     results = {}
     api_ports = {'insight': 8501, 'media': 8502, 'query': 8503}
+    payload = {'query': query, 'task_id': task_id, 'client_id': client_id}
 
     for app_name in running_apps:
         if app_name not in api_ports:
             continue
         try:
-            api_port = api_ports[app_name]
-            # 调用Streamlit应用的API端点
             response = requests.post(
-                f"http://localhost:{api_port}/api/search",
-                json={'query': query},
-                timeout=10
+                f"http://localhost:{api_ports[app_name]}/api/search",
+                json=payload,
+                timeout=10,
             )
             if response.status_code == 200:
                 results[app_name] = response.json()
             else:
                 results[app_name] = {'success': False, 'message': 'API调用失败'}
-        except Exception as e:
-            results[app_name] = {'success': False, 'message': str(e)}
-    
-    # 搜索完成后可以选择停止监控，或者让它继续运行以捕获后续的处理日志
-    # 这里我们让监控继续运行，用户可以通过其他接口手动停止
-    
+        except Exception as exc:
+            results[app_name] = {'success': False, 'message': str(exc)}
+
     return jsonify({
         'success': True,
         'query': query,
-        'results': results
+        'task_id': task_id,
+        'client_id': client_id,
+        'results': results,
     })
 
 
@@ -1240,8 +1238,16 @@ def shutdown_system():
         return jsonify({'success': False, 'message': f'系统关闭异常: {exc}'}), 500
 
 @socketio.on('connect')
-def handle_connect():
-    """客户端连接"""
+def handle_connect(auth=None):
+    """每个浏览器tab加入独立client room，避免跨设备/跨tab广播。"""
+    auth = auth if isinstance(auth, dict) else {}
+    raw_client_id = auth.get('client_id') or request.args.get('client_id')
+    if raw_client_id:
+        try:
+            client_id = validate_runtime_id(str(raw_client_id), 'client_id')
+            join_room(_client_room(client_id))
+        except ValueError:
+            logger.warning("Socket连接携带了非法client_id，未加入私有room")
     emit('status', 'Connected to Flask server')
 
 @socketio.on('request_status')
