@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from MediaEngine import DeepSearchAgent, AnspireSearchAgent, Settings
 from config import settings
 from utils.github_issues import error_with_issue_link
-from utils.task_runtime import ensure_task, new_task_id, task_log_context
+from utils.task_runtime import ensure_task, new_task_id, task_log_context, task_output_dir
 
 
 def main():
@@ -131,7 +131,7 @@ def main():
                 BOCHA_WEB_SEARCH_API_KEY=bocha_key,
                 MAX_REFLECTIONS=max_reflections,
                 SEARCH_CONTENT_MAX_LENGTH=max_content_length,
-                OUTPUT_DIR="media_engine_streamlit_reports",
+                OUTPUT_DIR=str(task_output_dir(task_id, "media")),
             )
         elif settings.SEARCH_TOOL_TYPE == "AnspireAPI":
             if not ansire_key:
@@ -147,7 +147,7 @@ def main():
                 ANSPIRE_API_KEY=ansire_key,
                 MAX_REFLECTIONS=max_reflections,
                 SEARCH_CONTENT_MAX_LENGTH=max_content_length,
-                OUTPUT_DIR="media_engine_streamlit_reports",
+                OUTPUT_DIR=str(task_output_dir(task_id, "media")),
             )
         else:
             st.error(f"未知的搜索工具类型: {settings.SEARCH_TOOL_TYPE}")
