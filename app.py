@@ -16,7 +16,7 @@ import threading
 from datetime import datetime
 from queue import Queue
 from flask import Flask, render_template, request, jsonify, Response
-from flask_socketio import SocketIO, emit, join_room
+from flask_socketio import SocketIO, emit, join_room, leave_room
 import atexit
 import requests
 from loguru import logger
@@ -399,6 +399,10 @@ def _client_room(client_id):
     return f"client:{validate_runtime_id(client_id, 'client_id')}"
 
 
+def _task_room(task_id):
+    return f"task:{validate_runtime_id(task_id)}"
+
+
 def _task_client_rooms(task_id):
     """返回订阅该task的全部浏览器tab/device room。"""
     rooms = []
@@ -437,13 +441,11 @@ def _read_new_task_log_lines(task_id, app_name):
 
 
 def monitor_task_runtime():
-    """只向创建该task的浏览器tab推送Forum事件和Agent日志。"""
+    """按task room推送Forum事件和Agent日志，活动页面自行订阅当前task。"""
     while True:
         try:
             for task_id in list_task_ids():
-                rooms = _task_client_rooms(task_id)
-                if not rooms:
-                    continue
+                room = _task_room(task_id)
 
                 after_id = forum_event_positions.get(task_id, 0)
                 events = list_events(task_id, after_id=after_id, limit=1000)
@@ -451,14 +453,13 @@ def monitor_task_runtime():
                     message = _forum_event_to_message(event)
                     if message:
                         line = _forum_event_to_log_line(event)
-                        for room in rooms:
-                            socketio.emit('forum_message', message, room=room)
-                            if line:
-                                socketio.emit(
-                                    'console_output',
-                                    {'app': 'forum', 'line': line, 'task_id': task_id},
-                                    room=room,
-                                )
+                        socketio.emit('forum_message', message, room=room)
+                        if line:
+                            socketio.emit(
+                                'console_output',
+                                {'app': 'forum', 'line': line, 'task_id': task_id},
+                                room=room,
+                            )
                     forum_event_positions[task_id] = max(
                         forum_event_positions.get(task_id, 0),
                         int(event.get('id', 0)),
@@ -466,12 +467,11 @@ def monitor_task_runtime():
 
                 for app_name in ('insight', 'media', 'query'):
                     for line in _read_new_task_log_lines(task_id, app_name):
-                        for room in rooms:
-                            socketio.emit(
-                                'console_output',
-                                {'app': app_name, 'line': line, 'task_id': task_id},
-                                room=room,
-                            )
+                        socketio.emit(
+                            'console_output',
+                            {'app': app_name, 'line': line, 'task_id': task_id},
+                            room=room,
+                        )
             time.sleep(0.5)
         except Exception as exc:
             logger.exception(f"task runtime监听异常: {exc}")
@@ -1070,12 +1070,11 @@ def test_log(app_name):
 
     test_msg = f"[{datetime.now().strftime('%H:%M:%S')}] 测试日志消息 - {datetime.now()}"
     write_log_to_file(app_name, test_msg, task_id=task_id)
-    for room in _task_client_rooms(task_id):
-        socketio.emit(
-            'console_output',
-            {'app': app_name, 'line': test_msg, 'task_id': task_id},
-            room=room,
-        )
+    socketio.emit(
+        'console_output',
+        {'app': app_name, 'line': test_msg, 'task_id': task_id},
+        room=_task_room(task_id),
+    )
     return jsonify({'success': True, 'task_id': task_id, 'message': '测试消息已写入task日志'})
 
 
@@ -1343,6 +1342,25 @@ def handle_connect(auth=None):
         except ValueError:
             logger.warning("Socket连接携带了非法client_id，未加入私有room")
     emit('status', 'Connected to Flask server')
+
+
+@socketio.on('subscribe_task')
+def handle_subscribe_task(data=None):
+    """让当前浏览器连接只订阅当前task的实时流。"""
+    data = data if isinstance(data, dict) else {}
+    try:
+        task_id = validate_runtime_id(str(data.get('task_id') or ''))
+        previous_task_id = data.get('previous_task_id')
+        if previous_task_id:
+            try:
+                leave_room(_task_room(str(previous_task_id)))
+            except ValueError:
+                pass
+        join_room(_task_room(task_id))
+        emit('task_subscription', {'success': True, 'task_id': task_id})
+    except ValueError as exc:
+        emit('task_subscription', {'success': False, 'message': str(exc)})
+
 
 @socketio.on('request_status')
 def handle_status_request():
