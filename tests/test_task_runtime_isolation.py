@@ -1,14 +1,19 @@
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import pytest
 
 from loguru import logger
 
-from ForumEngine.task_store import append_event, latest_host_speech, list_events
+from ForumEngine.task_store import append_event, latest_host_speech, list_events, publish_agent_speech
 from utils.task_runtime import (
     ensure_task,
+    latest_task_report,
     list_task_clients,
     task_log_context,
     task_log_path,
     task_output_dir,
+    validate_runtime_id,
 )
 
 
@@ -72,3 +77,70 @@ def test_loguru_task_context_filters_concurrent_sinks(monkeypatch, tmp_path):
     assert "message-b" not in a_text
     assert "message-b" in b_text
     assert "message-a" not in b_text
+
+
+
+def test_task_id_rejects_path_traversal(monkeypatch, tmp_path):
+    _use_tmp_runtime(monkeypatch, tmp_path)
+    invalid_ids = (
+        "",
+        "../victim",
+        "task/other",
+        "task\\other",
+        ".hidden",
+        "a" * 97,
+    )
+    for invalid in invalid_ids:
+        with pytest.raises(ValueError):
+            validate_runtime_id(invalid)
+
+
+def test_concurrent_forum_writers_never_cross_task_boundary(monkeypatch, tmp_path):
+    _use_tmp_runtime(monkeypatch, tmp_path)
+    ensure_task("task_concurrent_a", client_id="client_a")
+    ensure_task("task_concurrent_b", client_id="client_b")
+
+    def write(task_id, index):
+        source = ("QUERY", "MEDIA", "INSIGHT")[index % 3]
+        publish_agent_speech(
+            task_id,
+            source,
+            f"{task_id}-event-{index}",
+            trigger_host=False,
+        )
+
+    futures = []
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        for index in range(40):
+            futures.append(pool.submit(write, "task_concurrent_a", index))
+            futures.append(pool.submit(write, "task_concurrent_b", index))
+        for future in futures:
+            future.result(timeout=15)
+
+    events_a = list_events("task_concurrent_a", limit=100)
+    events_b = list_events("task_concurrent_b", limit=100)
+
+    assert len(events_a) == 40
+    assert len(events_b) == 40
+    assert all(
+        str(event["content"]).startswith("task_concurrent_a-")
+        for event in events_a
+    )
+    assert all(
+        str(event["content"]).startswith("task_concurrent_b-")
+        for event in events_b
+    )
+
+
+def test_latest_report_lookup_never_crosses_task(monkeypatch, tmp_path):
+    _use_tmp_runtime(monkeypatch, tmp_path)
+
+    alpha_dir = task_output_dir("task_report_a", "query")
+    beta_dir = task_output_dir("task_report_b", "query")
+    alpha = alpha_dir / "alpha.md"
+    beta = beta_dir / "beta.md"
+    alpha.write_text("alpha report", encoding="utf-8")
+    beta.write_text("beta report", encoding="utf-8")
+
+    assert latest_task_report("task_report_a", "query") == alpha
+    assert latest_task_report("task_report_b", "query") == beta
