@@ -47,6 +47,8 @@ class FirstSummaryNode(StateMutationNode):
         """
         super().__init__(llm_client, "FirstSummaryNode")
         self.task_id = task_id
+        self.source = source
+        self.task_id = task_id
         self.agent_source = agent_source
     
     def validate_input(self, input_data: Any) -> bool:
@@ -198,6 +200,15 @@ class FirstSummaryNode(StateMutationNode):
         try:
             # 生成总结
             summary = self.run(input_data, **kwargs)
+
+            # 直接向当前 task 的 Forum 事件流发布，不再依赖全局日志扫描。
+            if self.task_id and self.source:
+                try:
+                    from ForumEngine.task_store import publish_agent_speech
+                    publish_agent_speech(self.task_id, self.source, summary)
+                except Exception as forum_error:
+                    logger.exception(f"发布首次总结到 Forum 失败: {forum_error}")
+
             
             # 更新状态
             if 0 <= paragraph_index < len(state.paragraphs):
@@ -227,6 +238,8 @@ class ReflectionSummaryNode(StateMutationNode):
             agent_source: Forum中的Agent来源标签
         """
         super().__init__(llm_client, "ReflectionSummaryNode")
+        self.task_id = task_id
+        self.source = source
         self.task_id = task_id
         self.agent_source = agent_source
     
@@ -379,6 +392,15 @@ class ReflectionSummaryNode(StateMutationNode):
         try:
             # 生成更新后的总结
             updated_summary = self.run(input_data, **kwargs)
+
+            # 直接向当前 task 的 Forum 事件流发布，不再依赖全局日志扫描。
+            if self.task_id and self.source:
+                try:
+                    from ForumEngine.task_store import publish_agent_speech
+                    publish_agent_speech(self.task_id, self.source, summary)
+                except Exception as forum_error:
+                    logger.exception(f"发布首次总结到 Forum 失败: {forum_error}")
+
             
             # 更新状态
             if 0 <= paragraph_index < len(state.paragraphs):
