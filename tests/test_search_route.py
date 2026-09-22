@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import Mock, patch
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from flask import Blueprint
@@ -72,8 +73,8 @@ def root_app(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "ReportEngine", report_package)
     monkeypatch.setitem(sys.modules, "ReportEngine.flask_interface", report_interface)
     monkeypatch.setitem(sys.modules, "flask_socketio", socketio_module)
-    monkeypatch.setenv("BETTAFISH_RUNTIME_DIR", str(tmp_path / "runtime" / "tasks"))
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BETTAFISH_RUNTIME_DIR", str(tmp_path / "runtime" / "tasks"))
 
     source_path = Path(__file__).resolve().parents[1] / "app.py"
     spec = importlib.util.spec_from_file_location("bettafish_app_under_test", source_path)
@@ -86,55 +87,20 @@ def root_app(monkeypatch, tmp_path):
         spec.loader.exec_module(module)
 
     try:
-        yield module, module.app.test_client()
+        yield module, module.app.test_client(), tmp_path
     finally:
         _remove_modules(prefixes)
         sys.modules.update(saved_modules)
 
 
-def test_search_propagates_task_identity_to_searchable_engine(root_app, monkeypatch):
-    module, client = root_app
+def test_search_returns_task_scoped_streamlit_launch_url(root_app, monkeypatch):
+    module, client, tmp_path = root_app
     module.processes = {
-        "insight": {"status": "running"},
-        "forum": {"status": "running"},
+        "insight": {"status": "running", "port": 8501},
+        "media": {"status": "stopped", "port": 8502},
+        "query": {"status": "stopped", "port": 8503},
+        "forum": {"status": "running", "port": None},
     }
-    monkeypatch.setattr(module, "check_app_status", lambda: None)
-    engine_response = Mock(status_code=200)
-    engine_response.json.return_value = {"success": True, "items": ["result"]}
-    post = Mock(return_value=engine_response)
-    monkeypatch.setattr(module.requests, "post", post)
-
-    response = client.post(
-        "/api/search",
-        json={
-            "query": "BettaFish",
-            "task_id": "task_alpha",
-            "client_id": "client_tab_a",
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.get_json() == {
-        "success": True,
-        "query": "BettaFish",
-        "task_id": "task_alpha",
-        "client_id": "client_tab_a",
-        "results": {"insight": {"success": True, "items": ["result"]}},
-    }
-    post.assert_called_once_with(
-        "http://localhost:8501/api/search",
-        json={
-            "query": "BettaFish",
-            "task_id": "task_alpha",
-            "client_id": "client_tab_a",
-        },
-        timeout=10,
-    )
-
-
-def test_search_with_only_forum_keeps_task_but_calls_no_engine(root_app, monkeypatch):
-    module, client = root_app
-    module.processes = {"forum": {"status": "running"}}
     monkeypatch.setattr(module, "check_app_status", lambda: None)
     post = Mock()
     monkeypatch.setattr(module.requests, "post", post)
@@ -142,66 +108,74 @@ def test_search_with_only_forum_keeps_task_but_calls_no_engine(root_app, monkeyp
     response = client.post(
         "/api/search",
         json={
-            "query": "BettaFish",
-            "task_id": "task_forum_only",
-            "client_id": "client_tab_b",
+            "query": "BettaFish 并发隔离",
+            "task_id": "task_test_1",
+            "client_id": "client_test_1",
         },
     )
 
     assert response.status_code == 200
-    assert response.get_json() == {
-        "success": True,
-        "query": "BettaFish",
-        "task_id": "task_forum_only",
-        "client_id": "client_tab_b",
-        "results": {},
-    }
+    payload = response.get_json()
+    assert payload["success"] is True
+    assert payload["task_id"] == "task_test_1"
+    assert payload["client_id"] == "client_test_1"
+    assert set(payload["launch_urls"]) == {"insight"}
+
+    parsed = urlparse(payload["launch_urls"]["insight"])
+    assert parsed.port == 8501
+    params = parse_qs(parsed.query)
+    assert params["query"] == ["BettaFish 并发隔离"]
+    assert params["auto_search"] == ["true"]
+    assert params["task_id"] == ["task_test_1"]
+    assert params["client_id"] == ["client_test_1"]
+
+    # Streamlit没有Flask式/api/search，主应用不得再发送伪API POST。
     post.assert_not_called()
+    assert (tmp_path / "runtime" / "tasks" / "task_test_1").is_dir()
 
 
-def test_search_rejects_path_traversal_task_id(root_app, monkeypatch):
-    module, client = root_app
-    module.processes = {"insight": {"status": "running"}}
+def test_search_with_only_forum_returns_no_engine_error(root_app, monkeypatch):
+    module, client, _ = root_app
+    module.processes = {"forum": {"status": "running", "port": None}}
     monkeypatch.setattr(module, "check_app_status", lambda: None)
 
     response = client.post(
         "/api/search",
         json={
             "query": "BettaFish",
-            "task_id": "../another-user",
-            "client_id": "client_tab_c",
+            "task_id": "task_forum_only",
+            "client_id": "client_forum_only",
         },
     )
 
     assert response.status_code == 400
-    assert response.get_json()["success"] is False
+    payload = response.get_json()
+    assert payload["success"] is False
+    assert payload["task_id"] == "task_forum_only"
+    assert payload["results"] == {}
 
 
-def test_forum_api_never_returns_another_tasks_events(root_app):
-    module, client = root_app
-    from ForumEngine.task_store import append_event
+def test_output_requires_task_id(root_app):
+    module, client, _ = root_app
+    module.processes = {"query": {"status": "running", "port": 8503}}
 
-    module.ensure_task("task_a", client_id="client_a", query="alpha")
-    module.ensure_task("task_b", client_id="client_b", query="beta")
-    append_event("task_a", "QUERY", "alpha-only evidence")
-    append_event("task_b", "MEDIA", "beta-only evidence")
-    append_event("task_a", "HOST", "alpha-only host")
+    response = client.get("/api/output/query")
 
-    response_a = client.get("/api/forum/log?task_id=task_a")
-    response_b = client.get("/api/forum/log?task_id=task_b")
+    assert response.status_code == 400
+    assert response.get_json()["message"] == "缺少task_id"
 
-    assert response_a.status_code == 200
-    assert response_b.status_code == 200
 
-    body_a = response_a.get_json()
-    body_b = response_b.get_json()
-    content_a = "\n".join(body_a["log_lines"])
-    content_b = "\n".join(body_b["log_lines"])
+def test_task_output_endpoint_never_reads_other_task(root_app):
+    module, client, _ = root_app
+    module.processes = {"query": {"status": "running", "port": 8503}}
+    module.ensure_task("task_a", client_id="client_a", query="A")
+    module.ensure_task("task_b", client_id="client_b", query="B")
+    module.write_log_to_file("query", "A-only", task_id="task_a")
+    module.write_log_to_file("query", "B-only", task_id="task_b")
 
-    assert "alpha-only evidence" in content_a
-    assert "alpha-only host" in content_a
-    assert "beta-only evidence" not in content_a
+    response = client.get("/api/output/query?task_id=task_a")
+    payload = response.get_json()
 
-    assert "beta-only evidence" in content_b
-    assert "alpha-only evidence" not in content_b
-    assert "alpha-only host" not in content_b
+    assert response.status_code == 200
+    assert payload["output"] == ["A-only"]
+    assert "B-only" not in payload["output"]
