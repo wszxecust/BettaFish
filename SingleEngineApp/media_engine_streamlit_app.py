@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from MediaEngine import DeepSearchAgent, AnspireSearchAgent, Settings
 from config import settings
 from utils.github_issues import error_with_issue_link
+from utils.task_runtime import ensure_task, new_task_id, task_log_context
 
 
 def main():
@@ -51,11 +52,15 @@ def main():
         query_params = st.query_params
         auto_query = query_params.get('query', '')
         auto_search = query_params.get('auto_search', 'false').lower() == 'true'
+        auto_task_id = query_params.get('task_id', '')
+        auto_client_id = query_params.get('client_id', '')
     except AttributeError:
         # 兼容旧版本
         query_params = st.experimental_get_query_params()
         auto_query = query_params.get('query', [''])[0]
         auto_search = query_params.get('auto_search', ['false'])[0].lower() == 'true'
+        auto_task_id = query_params.get('task_id', [''])[0]
+        auto_client_id = query_params.get('client_id', [''])[0]
 
     # ----- 配置被硬编码 -----
     # 强制使用 Gemini
@@ -79,12 +84,16 @@ def main():
         label_visibility="hidden"
     )
 
-    # 自动搜索逻辑
+    # 自动搜索逻辑：同一浏览器会话可以连续运行多个独立task。
     start_research = False
     query = auto_query
+    task_id = (auto_task_id or '').strip() or new_task_id()
+    client_id = (auto_client_id or '').strip() or None
+    execution_key = f"auto_search_executed:{task_id}"
 
-    if auto_search and auto_query and 'auto_search_executed' not in st.session_state:
-        st.session_state.auto_search_executed = True
+    if auto_search and auto_query and execution_key not in st.session_state:
+        ensure_task(task_id, client_id=client_id, query=query)
+        st.session_state[execution_key] = True
         start_research = True
     elif auto_query and not auto_search:
         st.warning("等待搜索启动信号...")
@@ -146,10 +155,16 @@ def main():
             return
 
         # 执行研究
-        execute_research(query, config)
+        execute_research(query, config, task_id)
 
 
-def execute_research(query: str, config: Settings):
+def execute_research(query: str, config: Settings, task_id: str):
+    """在task隔离的日志上下文中执行研究。"""
+    with task_log_context(task_id, "media"):
+        return _execute_research(query, config, task_id)
+
+
+def _execute_research(query: str, config: Settings, task_id: str):
     """执行研究"""
     try:
         # 创建进度条
@@ -159,9 +174,9 @@ def execute_research(query: str, config: Settings):
         # 初始化Agent
         status_text.text("正在初始化Agent...")
         if config.SEARCH_TOOL_TYPE == "BochaAPI":
-            agent = DeepSearchAgent(config)
+            agent = DeepSearchAgent(config, task_id=task_id)
         elif config.SEARCH_TOOL_TYPE == "AnspireAPI":
-            agent = AnspireSearchAgent(config)
+            agent = AnspireSearchAgent(config, task_id=task_id)
         else:
             raise ValueError(f"未知的搜索工具类型: {config.SEARCH_TOOL_TYPE}")
         st.session_state.agent = agent
