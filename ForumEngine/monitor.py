@@ -836,24 +836,32 @@ class LogMonitor:
         except Exception:
             return None
 
-# 全局监控器实例
+# 旧的 LogMonitor 类保留用于日志解析单元测试与离线兼容，但生产主链路
+# 不再启动它。Forum 事件由 SummaryNode 直接写入 task-scoped SQLite。
 _monitor_instance = None
 
 def get_monitor() -> LogMonitor:
-    """获取全局监控器实例"""
+    """仅供旧测试/离线工具显式使用，不应挂到生产研究主链路。"""
     global _monitor_instance
     if _monitor_instance is None:
         _monitor_instance = LogMonitor()
     return _monitor_instance
 
+
 def start_forum_monitoring():
-    """启动ForumEngine智能监控"""
-    return get_monitor().start_monitoring()
+    """兼容旧调用：task-scoped Forum 不需要全局日志监听线程。"""
+    logger.info("ForumEngine: 已启用task-scoped事件通道，跳过legacy全局日志监听")
+    return True
+
 
 def stop_forum_monitoring():
-    """停止ForumEngine监控"""
-    get_monitor().stop_monitoring()
+    """兼容旧调用：无全局Forum监听线程需要停止。"""
+    return True
 
-def get_forum_log():
-    """获取forum.log内容"""
-    return get_monitor().get_forum_log_content()
+
+def get_forum_log(task_id: str = None):
+    """兼容读取接口，但必须明确task_id，禁止回退到logs/forum.log。"""
+    if not task_id:
+        raise ValueError("读取Forum日志必须提供task_id")
+    from .task_store import render_forum_log
+    return [line for line in render_forum_log(task_id).splitlines() if line.strip()]
