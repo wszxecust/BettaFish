@@ -24,7 +24,7 @@ from utils.task_runtime import ensure_task, task_forum_db_path, validate_runtime
 AGENT_SOURCES = ("QUERY", "MEDIA", "INSIGHT")
 VALID_SOURCES = set(AGENT_SOURCES) | {"HOST", "SYSTEM"}
 DEFAULT_HOST_THRESHOLD = 5
-HOST_LEASE_SECONDS = 300.0
+HOST_LEASE_SECONDS = 900.0
 
 
 def _connect(task_id: str) -> sqlite3.Connection:
@@ -315,36 +315,46 @@ def _release_host_claim(task_id: str, token: str) -> None:
 
 
 def _generate_host_if_ready(task_id: str) -> None:
-    claim = _claim_host_batch(task_id)
-    if not claim:
-        return
-    token = str(claim["token"])
-    try:
-        from .llm_host import generate_host_speech
+    """Drain every complete speech batch for this task.
 
-        speeches = []
-        for event in claim["events"]:
-            created_at = str(event.get("created_at", ""))
-            try:
-                timestamp = datetime.fromisoformat(created_at).astimezone().strftime("%H:%M:%S")
-            except Exception:
-                timestamp = "--:--:--"
-            content = str(event["content"]).replace("\n", "\\n").replace("\r", "\\r")
-            speeches.append(f"[{timestamp}] [{event['source']}] {content}")
+    A host call may take long enough that later agent speeches arrive while a
+    lease is held.  Looping after a successful batch prevents those queued
+    speeches from waiting forever for an eleventh speech to retrigger hosting.
+    """
+    while True:
+        claim = _claim_host_batch(task_id)
+        if not claim:
+            return
+        token = str(claim["token"])
+        try:
+            from .llm_host import generate_host_speech
 
-        host_speech = generate_host_speech(speeches)
-        if host_speech:
+            speeches = []
+            for event in claim["events"]:
+                created_at = str(event.get("created_at", ""))
+                try:
+                    timestamp = datetime.fromisoformat(created_at).astimezone().strftime("%H:%M:%S")
+                except Exception:
+                    timestamp = "--:--:--"
+                content = str(event["content"]).replace("\n", "\\n").replace("\r", "\\r")
+                speeches.append(f"[{timestamp}] [{event['source']}] {content}")
+
+            host_speech = generate_host_speech(speeches)
+            if not host_speech:
+                _release_host_claim(task_id, token)
+                return
             _finish_host_batch(
                 task_id,
                 token,
                 int(claim["end_id"]),
                 str(host_speech),
             )
-        else:
+            # Continue: more than one full batch may have accumulated while the
+            # LLM was generating the previous HOST message.
+        except Exception:
+            logger.exception(f"ForumEngine: task={task_id} 主持人生成失败")
             _release_host_claim(task_id, token)
-    except Exception:
-        logger.exception(f"ForumEngine: task={task_id} 主持人生成失败")
-        _release_host_claim(task_id, token)
+            return
 
 
 def publish_agent_speech(
