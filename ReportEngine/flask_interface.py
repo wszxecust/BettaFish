@@ -21,6 +21,8 @@ from loguru import logger
 from .agent import ReportAgent, create_agent
 from .nodes import ChapterJsonParseError
 from .utils.config import settings
+from ForumEngine.task_store import render_forum_log
+from utils.task_runtime import latest_task_report, validate_runtime_id
 
 
 # 创建Blueprint
@@ -279,7 +281,7 @@ class ReportTask:
     既供后台线程更新，也供HTTP接口读取。
     """
 
-    def __init__(self, query: str, task_id: str, custom_template: str = ""):
+    def __init__(self, query: str, task_id: str, custom_template: str = "", research_task_id: Optional[str] = None):
         """
         初始化任务对象，记录查询词、自定义模板与运行期元数据。
 
@@ -289,6 +291,7 @@ class ReportTask:
             custom_template: 可选的自定义Markdown模板
         """
         self.task_id = task_id
+        self.research_task_id = research_task_id or task_id
         self.query = query
         self.custom_template = custom_template
         self.status = "pending"  # 四种状态（pending/running/completed/error）
@@ -347,6 +350,7 @@ class ReportTask:
         """转换为字典格式，方便直接返回给JSON API。"""
         return {
             'task_id': self.task_id,
+            'research_task_id': self.research_task_id,
             'query': self.query,
             'status': self.status,
             'progress': self.progress,
@@ -404,33 +408,36 @@ class ReportTask:
             return [evt for evt in self.event_history if evt['id'] > last_event_id]
 
 
-def check_engines_ready() -> Dict[str, Any]:
-    """
-    检查三个子引擎是否都有新文件。
-
-    调用 ReportAgent 的基准检测逻辑，并附带论坛日志存在性，
-    是 /status、/generate 的前置校验。
-    """
-    directories = {
-        'insight': 'insight_engine_streamlit_reports',
-        'media': 'media_engine_streamlit_reports',
-        'query': 'query_engine_streamlit_reports'
-    }
-
-    forum_log_path = 'logs/forum.log'
-
+def check_engines_ready(research_task_id: Optional[str] = None) -> Dict[str, Any]:
+    """检查指定research task的三引擎产物，不再扫描全局最新文件。"""
     if not report_agent:
-        return {
-            'ready': False,
-            'error': 'Report Engine未初始化'
-        }
+        return {'ready': False, 'error': 'Report Engine未初始化', 'missing_files': []}
+    if not research_task_id:
+        return {'ready': False, 'error': '缺少research_task_id', 'missing_files': ['task_id']}
 
-    return report_agent.check_input_files(
-        directories['insight'],
-        directories['media'],
-        directories['query'],
-        forum_log_path
-    )
+    try:
+        research_task_id = validate_runtime_id(research_task_id)
+    except ValueError as exc:
+        return {'ready': False, 'error': str(exc), 'missing_files': ['task_id']}
+
+    latest_files = {}
+    missing_files = []
+    files_found = []
+    for engine in ('insight', 'media', 'query'):
+        path = latest_task_report(research_task_id, engine)
+        if path is None:
+            missing_files.append(f"{engine}: task尚未生成Markdown报告")
+        else:
+            latest_files[engine] = str(path)
+            files_found.append(f"{engine}: {path.name}")
+
+    return {
+        'ready': not missing_files,
+        'research_task_id': research_task_id,
+        'missing_files': missing_files,
+        'files_found': files_found,
+        'latest_files': latest_files,
+    }
 
 
 def run_report_generation(task: ReportTask, query: str, custom_template: str = ""):
@@ -460,7 +467,7 @@ def run_report_generation(task: ReportTask, query: str, custom_template: str = "
         task.publish_event('stage', {'message': '任务已启动，正在检查输入文件', 'stage': 'prepare'})
 
         # 检查输入文件
-        check_result = check_engines_ready()
+        check_result = check_engines_ready(task.research_task_id)
         if not check_result['ready']:
             task.update_status("error", 0, f"输入文件未准备就绪: {check_result.get('missing_files', [])}")
             return
@@ -473,7 +480,12 @@ def run_report_generation(task: ReportTask, query: str, custom_template: str = "
 
         # 加载输入文件
         content = report_agent.load_input_files(check_result['latest_files'])
-        task.publish_event('stage', {'message': '源数据加载完成，启动生成流程', 'stage': 'data_loaded'})
+        content['forum_logs'] = render_forum_log(task.research_task_id)
+        task.publish_event('stage', {
+            'message': '源数据加载完成，启动生成流程',
+            'stage': 'data_loaded',
+            'research_task_id': task.research_task_id,
+        })
 
         # 生成报告（附带兜底重试，缓解瞬时网络抖动）
         for attempt in range(1, 3):
@@ -583,15 +595,23 @@ def get_status():
         Response: JSON结构包含initialized/engines_ready/当前任务等。
     """
     try:
-        engines_status = check_engines_ready()
+        raw_task_id = request.args.get('task_id') or request.args.get('research_task_id')
+        research_task_id = validate_runtime_id(raw_task_id) if raw_task_id else None
+        engines_status = check_engines_ready(research_task_id)
+        visible_current = (
+            current_task
+            if current_task and current_task.research_task_id == research_task_id
+            else None
+        )
 
         return jsonify({
             'success': True,
             'initialized': report_agent is not None,
+            'research_task_id': research_task_id,
             'engines_ready': engines_status['ready'],
             'files_found': engines_status.get('files_found', []),
             'missing_files': engines_status.get('missing_files', []),
-            'current_task': current_task.to_dict() if current_task else None
+            'current_task': visible_current.to_dict() if visible_current else None
         })
     except Exception as e:
         logger.exception(f"获取Report Engine状态失败: {str(e)}")
@@ -623,9 +643,8 @@ def generate_report():
             if current_task and current_task.status == "running":
                 return jsonify({
                     'success': False,
-                    'error': '已有报告生成任务在运行中',
-                    'current_task': current_task.to_dict()
-                }), 400
+                    'error': 'Report Engine当前有任务运行，请稍后重试'
+                }), 409
 
             # 如果有已完成的任务，清理它
             if current_task and current_task.status in ["completed", "error"]:
@@ -638,6 +657,10 @@ def generate_report():
             data = {}
         query = data.get('query', '智能舆情分析报告')
         custom_template = data.get('custom_template', '')
+        raw_research_task_id = data.get('research_task_id') or data.get('task_id')
+        if not raw_research_task_id:
+            return jsonify({'success': False, 'error': '缺少research_task_id'}), 400
+        research_task_id = validate_runtime_id(str(raw_research_task_id))
 
         # 清空日志文件
         clear_report_log()
@@ -650,7 +673,7 @@ def generate_report():
             }), 500
 
         # 检查输入文件是否准备就绪
-        engines_status = check_engines_ready()
+        engines_status = check_engines_ready(research_task_id)
         if not engines_status['ready']:
             return jsonify({
                 'success': False,
@@ -660,7 +683,7 @@ def generate_report():
 
         # 创建新任务
         task_id = f"report_{int(time.time())}"
-        task = ReportTask(query, task_id, custom_template)
+        task = ReportTask(query, task_id, custom_template, research_task_id=research_task_id)
 
         with task_lock:
             current_task = task
@@ -689,6 +712,7 @@ def generate_report():
         return jsonify({
             'success': True,
             'task_id': task_id,
+            'research_task_id': research_task_id,
             'message': '报告生成已启动',
             'task': task.to_dict(),
             'stream_url': f"/api/report/stream/{task_id}"
