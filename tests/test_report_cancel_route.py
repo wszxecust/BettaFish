@@ -107,3 +107,47 @@ def test_cancel_missing_task_returns_not_found(report_interface):
 
     assert response.status_code == 404
     assert response.get_json()["success"] is False
+
+
+def test_generate_rejects_second_active_report_for_same_research(
+    report_interface,
+    monkeypatch,
+):
+    module, client = report_interface
+    module.report_agent = True
+    module.tasks_registry.clear()
+
+    active = module.ReportTask(
+        query="first",
+        task_id="report_active",
+        research_task_id="research_shared",
+    )
+    active.status = "running"
+    module.tasks_registry[active.task_id] = active
+
+    monkeypatch.setattr(
+        module,
+        "check_engines_ready",
+        lambda research_task_id: {
+            "ready": True,
+            "research_task_id": research_task_id,
+            "missing_files": [],
+            "files_found": [],
+            "latest_files": {},
+        },
+    )
+
+    response = client.post(
+        "/api/report/generate",
+        json={
+            "query": "second",
+            "research_task_id": "research_shared",
+            "client_id": "client_test",
+        },
+    )
+
+    assert response.status_code == 409
+    payload = response.get_json()
+    assert payload["success"] is False
+    assert payload["current_task"]["task_id"] == "report_active"
+    assert active.status == "running"
