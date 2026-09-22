@@ -18,7 +18,7 @@ def _remove_modules(prefix):
 
 
 @pytest.fixture
-def report_interface(monkeypatch):
+def report_interface(monkeypatch, tmp_path):
     saved_modules = _remove_modules("ReportEngine")
 
     agent_module = ModuleType("ReportEngine.agent")
@@ -37,6 +37,7 @@ def report_interface(monkeypatch):
     monkeypatch.setitem(sys.modules, "ReportEngine.nodes", nodes_module)
     monkeypatch.setitem(sys.modules, "ReportEngine.utils", utils_package)
     monkeypatch.setitem(sys.modules, "ReportEngine.utils.config", config_module)
+    monkeypatch.setenv("BETTAFISH_RUNTIME_DIR", str(tmp_path / "runtime" / "tasks"))
 
     module = importlib.import_module("ReportEngine.flask_interface")
     flask_app = Flask(__name__)
@@ -50,29 +51,18 @@ def report_interface(monkeypatch):
 
 
 def _task(module, task_id, status):
-    task = module.ReportTask(query="test", task_id=task_id)
+    task = module.ReportTask(
+        query="test",
+        task_id=task_id,
+        research_task_id="research_test",
+    )
     task.status = status
     return task
-
-
-def test_cancel_current_running_task_returns_success(report_interface):
-    module, client = report_interface
-    task = _task(module, "current-running", "running")
-    module.current_task = task
-    module.tasks_registry.clear()
-
-    response = client.post("/api/report/cancel/current-running")
-
-    assert response.status_code == 200
-    assert response.get_json()["success"] is True
-    assert task.status == "cancelled"
-    assert module.current_task is None
 
 
 def test_cancel_registry_running_task_returns_success(report_interface):
     module, client = report_interface
     task = _task(module, "registry-running", "running")
-    module.current_task = None
     module.tasks_registry.clear()
     module.tasks_registry[task.task_id] = task
 
@@ -86,7 +76,6 @@ def test_cancel_registry_running_task_returns_success(report_interface):
 def test_cancel_already_cancelled_task_is_idempotent(report_interface):
     module, client = report_interface
     task = _task(module, "already-cancelled", "cancelled")
-    module.current_task = None
     module.tasks_registry.clear()
     module.tasks_registry[task.task_id] = task
 
@@ -97,22 +86,21 @@ def test_cancel_already_cancelled_task_is_idempotent(report_interface):
 
 
 @pytest.mark.parametrize("status", ["completed", "error"])
-def test_cancel_terminal_task_returns_not_found(report_interface, status):
+def test_cancel_finished_task_is_not_cancelled(report_interface, status):
     module, client = report_interface
     task = _task(module, f"terminal-{status}", status)
-    module.current_task = None
     module.tasks_registry.clear()
     module.tasks_registry[task.task_id] = task
 
     response = client.post(f"/api/report/cancel/{task.task_id}")
 
-    assert response.status_code == 404
+    assert response.status_code == 400
     assert response.get_json()["success"] is False
+    assert task.status == status
 
 
 def test_cancel_missing_task_returns_not_found(report_interface):
     module, client = report_interface
-    module.current_task = None
     module.tasks_registry.clear()
 
     response = client.post("/api/report/cancel/missing")
