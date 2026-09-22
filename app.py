@@ -22,10 +22,12 @@ import requests
 from loguru import logger
 import importlib
 from pathlib import Path
+from urllib.parse import urlencode
 from MindSpider.main import MindSpider
 from ForumEngine.task_store import initialize_task_forum, list_events, render_forum_log
 from utils.task_runtime import (
     ensure_task,
+    list_task_clients,
     list_task_ids,
     new_client_id,
     new_task_id,
@@ -395,15 +397,15 @@ def _client_room(client_id):
     return f"client:{validate_runtime_id(client_id, 'client_id')}"
 
 
-def _task_client_room(task_id):
-    metadata = read_task_metadata(task_id)
-    client_id = metadata.get('client_id')
-    if not client_id:
-        return None
-    try:
-        return _client_room(client_id)
-    except ValueError:
-        return None
+def _task_client_rooms(task_id):
+    """返回订阅该task的全部浏览器tab/device room。"""
+    rooms = []
+    for client_id in list_task_clients(task_id):
+        try:
+            rooms.append(_client_room(client_id))
+        except ValueError:
+            continue
+    return rooms
 
 
 forum_event_positions = {}
@@ -437,8 +439,8 @@ def monitor_task_runtime():
     while True:
         try:
             for task_id in list_task_ids():
-                room = _task_client_room(task_id)
-                if not room:
+                rooms = _task_client_rooms(task_id)
+                if not rooms:
                     continue
 
                 after_id = forum_event_positions.get(task_id, 0)
@@ -446,14 +448,15 @@ def monitor_task_runtime():
                 for event in events:
                     message = _forum_event_to_message(event)
                     if message:
-                        socketio.emit('forum_message', message, room=room)
                         line = _forum_event_to_log_line(event)
-                        if line:
-                            socketio.emit(
-                                'console_output',
-                                {'app': 'forum', 'line': line, 'task_id': task_id},
-                                room=room,
-                            )
+                        for room in rooms:
+                            socketio.emit('forum_message', message, room=room)
+                            if line:
+                                socketio.emit(
+                                    'console_output',
+                                    {'app': 'forum', 'line': line, 'task_id': task_id},
+                                    room=room,
+                                )
                     forum_event_positions[task_id] = max(
                         forum_event_positions.get(task_id, 0),
                         int(event.get('id', 0)),
@@ -461,11 +464,12 @@ def monitor_task_runtime():
 
                 for app_name in ('insight', 'media', 'query'):
                     for line in _read_new_task_log_lines(task_id, app_name):
-                        socketio.emit(
-                            'console_output',
-                            {'app': app_name, 'line': line, 'task_id': task_id},
-                            room=room,
-                        )
+                        for room in rooms:
+                            socketio.emit(
+                                'console_output',
+                                {'app': app_name, 'line': line, 'task_id': task_id},
+                                room=room,
+                            )
             time.sleep(0.5)
         except Exception as exc:
             logger.exception(f"task runtime监听异常: {exc}")
@@ -990,8 +994,7 @@ def test_log(app_name):
 
     test_msg = f"[{datetime.now().strftime('%H:%M:%S')}] 测试日志消息 - {datetime.now()}"
     write_log_to_file(app_name, test_msg, task_id=task_id)
-    room = _task_client_room(task_id)
-    if room:
+    for room in _task_client_rooms(task_id):
         socketio.emit(
             'console_output',
             {'app': app_name, 'line': test_msg, 'task_id': task_id},
@@ -1070,7 +1073,11 @@ def get_forum_log_history():
 
 @app.route('/api/search', methods=['POST'])
 def search():
-    """统一搜索接口：生成/沿用task_id并把它传给每个子引擎。"""
+    """创建research task并返回三个Streamlit的task-scoped启动URL。
+
+    Streamlit本身没有Flask式 /api/search 端点，因此不再向8501/8502/8503
+    发送无效POST。真正启动研究由前端iframe携带query参数访问各Streamlit服务。
+    """
     data = request.get_json(silent=True) or {}
     query = str(data.get('query', '')).strip()
     if not query:
@@ -1087,37 +1094,40 @@ def search():
 
     ensure_task(task_id, client_id=client_id, query=query)
     initialize_task_forum(task_id)
-
     check_app_status()
-    running_apps = [name for name, info in processes.items() if info['status'] == 'running']
-    if not running_apps:
-        return jsonify({'success': False, 'message': '没有运行中的应用'}), 400
 
+    launch_urls = {}
     results = {}
-    api_ports = {'insight': 8501, 'media': 8502, 'query': 8503}
-    payload = {'query': query, 'task_id': task_id, 'client_id': client_id}
-
-    for app_name in running_apps:
-        if app_name not in api_ports:
+    for app_name in ('insight', 'media', 'query'):
+        info = processes.get(app_name, {})
+        if info.get('status') != 'running':
+            results[app_name] = {'success': False, 'message': '应用未运行'}
             continue
-        try:
-            response = requests.post(
-                f"http://localhost:{api_ports[app_name]}/api/search",
-                json=payload,
-                timeout=10,
-            )
-            if response.status_code == 200:
-                results[app_name] = response.json()
-            else:
-                results[app_name] = {'success': False, 'message': 'API调用失败'}
-        except Exception as exc:
-            results[app_name] = {'success': False, 'message': str(exc)}
+        params = urlencode({
+            'query': query,
+            'auto_search': 'true',
+            'task_id': task_id,
+            'client_id': client_id,
+        })
+        url = f"http://localhost:{info['port']}/?{params}"
+        launch_urls[app_name] = url
+        results[app_name] = {'success': True, 'launch_url': url}
+
+    if not launch_urls:
+        return jsonify({
+            'success': False,
+            'message': '没有运行中的研究引擎',
+            'task_id': task_id,
+            'client_id': client_id,
+            'results': results,
+        }), 400
 
     return jsonify({
         'success': True,
         'query': query,
         'task_id': task_id,
         'client_id': client_id,
+        'launch_urls': launch_urls,
         'results': results,
     })
 
