@@ -33,7 +33,9 @@ from utils.task_runtime import (
     new_task_id,
     read_task_metadata,
     task_log_path,
+    task_summary,
     validate_runtime_id,
+    workspace_has_task,
 )
 
 # 导入ReportEngine
@@ -852,7 +854,10 @@ atexit.register(cleanup_processes)
 def index():
     """主页：先加载task隔离bootstrap，再执行旧版页面脚本。"""
     html = render_template('index.html')
-    bootstrap = '<script src="/static/task_isolation.js"></script>'
+    bootstrap = (
+        '<script src="/static/task_isolation.js"></script>'
+        '<script src="/static/task_sidebar.js" defer></script>'
+    )
     if '<head>' in html:
         html = html.replace('<head>', '<head>' + bootstrap, 1)
     else:
@@ -936,9 +941,49 @@ def _task_id_from_request(payload=None):
     return validate_runtime_id(str(raw))
 
 
-@app.route('/api/tasks', methods=['POST'])
-def create_research_task():
-    """创建/确认一个研究task及其浏览器tab归属。"""
+def _workspace_id_from_request(payload=None):
+    payload = payload if isinstance(payload, dict) else {}
+    raw = (
+        payload.get('workspace_id')
+        or request.args.get('workspace_id')
+        or request.headers.get('X-BettaFish-Workspace-ID')
+    )
+    if not raw:
+        return None
+    return validate_runtime_id(str(raw), 'workspace_id')
+
+
+@app.route('/api/tasks', methods=['GET', 'POST'])
+def research_tasks():
+    """创建task或返回当前浏览器workspace可见的历史task。"""
+    if request.method == 'GET':
+        try:
+            workspace_id = _workspace_id_from_request()
+        except ValueError as exc:
+            return jsonify({'success': False, 'message': str(exc)}), 400
+        if not workspace_id:
+            return jsonify({'success': True, 'tasks': []})
+
+        tasks = []
+        for task_id in list_task_ids():
+            if workspace_has_task(task_id, workspace_id):
+                try:
+                    tasks.append(task_summary(task_id))
+                except Exception:
+                    logger.exception(f"读取task摘要失败: {task_id}")
+        tasks.sort(
+            key=lambda item: (
+                float(item.get('updated_at') or 0),
+                float(item.get('created_at') or 0),
+            ),
+            reverse=True,
+        )
+        return jsonify({
+            'success': True,
+            'workspace_id': workspace_id,
+            'tasks': tasks[:200],
+        })
+
     data = request.get_json(silent=True) or {}
     try:
         task_id = validate_runtime_id(str(data.get('task_id') or new_task_id()))
@@ -946,17 +991,48 @@ def create_research_task():
             str(data.get('client_id') or new_client_id()),
             'client_id',
         )
+        workspace_id = _workspace_id_from_request(data)
         query = str(data.get('query') or '')
-        ensure_task(task_id, client_id=client_id, query=query)
+        ensure_task(
+            task_id,
+            client_id=client_id,
+            workspace_id=workspace_id,
+            query=query,
+        )
         initialize_task_forum(task_id)
+        summary = task_summary(task_id)
         return jsonify({
             'success': True,
             'task_id': task_id,
             'client_id': client_id,
-            'query': query,
+            'workspace_id': workspace_id,
+            'query': summary.get('query', ''),
+            'task': summary,
         })
     except ValueError as exc:
         return jsonify({'success': False, 'message': str(exc)}), 400
+
+
+@app.route('/api/tasks/<task_id>', methods=['GET'])
+def get_research_task(task_id):
+    """返回一个workspace已经拥有的task详情。"""
+    try:
+        task_id = validate_runtime_id(str(task_id))
+        workspace_id = _workspace_id_from_request()
+    except ValueError as exc:
+        return jsonify({'success': False, 'message': str(exc)}), 400
+    if not workspace_id or not workspace_has_task(task_id, workspace_id):
+        return jsonify({'success': False, 'message': '任务不存在或当前设备无权访问'}), 404
+
+    metadata = read_task_metadata(task_id)
+    summary = task_summary(task_id)
+    return jsonify({
+        'success': True,
+        'task': {
+            **summary,
+            'metadata': metadata,
+        },
+    })
 
 
 @app.route('/api/output/<app_name>')
@@ -1089,10 +1165,16 @@ def search():
             str(data.get('client_id') or new_client_id()),
             'client_id',
         )
+        workspace_id = _workspace_id_from_request(data)
     except ValueError as exc:
         return jsonify({'success': False, 'message': str(exc)}), 400
 
-    ensure_task(task_id, client_id=client_id, query=query)
+    ensure_task(
+        task_id,
+        client_id=client_id,
+        workspace_id=workspace_id,
+        query=query,
+    )
     initialize_task_forum(task_id)
     check_app_status()
 
@@ -1108,6 +1190,7 @@ def search():
             'auto_search': 'true',
             'task_id': task_id,
             'client_id': client_id,
+            'workspace_id': workspace_id or '',
         })
         url = f"http://localhost:{info['port']}/?{params}"
         launch_urls[app_name] = url
@@ -1127,6 +1210,7 @@ def search():
         'query': query,
         'task_id': task_id,
         'client_id': client_id,
+        'workspace_id': workspace_id,
         'launch_urls': launch_urls,
         'results': results,
     })
