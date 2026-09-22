@@ -13,7 +13,9 @@ from utils.task_runtime import (
     finish_engine_run,
     latest_task_report,
     list_task_clients,
+    list_task_workspaces,
     task_log_context,
+    task_summary,
     task_log_path,
     task_output_dir,
     validate_runtime_id,
@@ -175,8 +177,51 @@ def test_failed_engine_run_can_be_retried(monkeypatch, tmp_path):
     token, status = claim_engine_run("task_retry", "media")
     assert status == "claimed"
     finish_engine_run("task_retry", "media", token, success=False)
-    assert engine_run_status("task_retry", "media") == "idle"
+    assert engine_run_status("task_retry", "media") == "failed"
 
     retry_token, retry_status = claim_engine_run("task_retry", "media")
     assert retry_token
     assert retry_status == "claimed"
+
+
+
+def test_workspace_can_own_same_task_across_multiple_devices(monkeypatch, tmp_path):
+    _use_tmp_runtime(monkeypatch, tmp_path)
+    ensure_task(
+        "task_shared_devices",
+        client_id="client_desktop",
+        workspace_id="workspace_desktop",
+        query="共享任务",
+    )
+    ensure_task(
+        "task_shared_devices",
+        client_id="client_phone",
+        workspace_id="workspace_phone",
+    )
+
+    assert list_task_workspaces("task_shared_devices") == [
+        "workspace_desktop",
+        "workspace_phone",
+    ]
+
+
+def test_task_summary_status_uses_right_side_indicator_states(monkeypatch, tmp_path):
+    _use_tmp_runtime(monkeypatch, tmp_path)
+    task_id = "task_status"
+    tokens = {}
+    for engine in ("insight", "media", "query"):
+        token, status = claim_engine_run(task_id, engine)
+        assert status == "claimed"
+        tokens[engine] = token
+
+    assert task_summary(task_id)["status"] == "running"
+
+    finish_engine_run(task_id, "insight", tokens["insight"], success=True)
+    finish_engine_run(task_id, "media", tokens["media"], success=True)
+    finish_engine_run(task_id, "query", tokens["query"], success=True)
+    assert task_summary(task_id)["status"] == "completed"
+
+    retry_task = "task_failed_status"
+    token, _ = claim_engine_run(retry_task, "query")
+    finish_engine_run(retry_task, "query", token, success=False)
+    assert task_summary(retry_task)["status"] == "failed"
