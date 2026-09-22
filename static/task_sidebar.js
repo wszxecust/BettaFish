@@ -376,15 +376,138 @@
     return data.task;
   }
 
+  function subscribeTask(taskId, previousTaskId = "") {
+    if (!taskId) return;
+    try {
+      if (typeof socket !== "undefined" && socket && socket.connected) {
+        socket.emit("subscribe_task", {
+          task_id: taskId,
+          previous_task_id: previousTaskId || ""
+        });
+      }
+    } catch (error) {
+      console.warn("[TaskSidebar] 订阅task实时流失败:", error);
+    }
+  }
+
+  function resetTaskViewState() {
+    try {
+      if (typeof lastLineCount !== "undefined") lastLineCount = {};
+      if (typeof forumLogLineCount !== "undefined") forumLogLineCount = 0;
+      if (typeof forumLogPosition !== "undefined") forumLogPosition = 0;
+      if (typeof forumMessagesCache !== "undefined") forumMessagesCache = [];
+      const chat = document.getElementById("forumChatArea");
+      if (chat) chat.innerHTML = "";
+
+      if (typeof consoleLayerApps !== "undefined" &&
+          typeof clearConsoleLayer === "function") {
+        consoleLayerApps.forEach(app => {
+          clearConsoleLayer(app, "[系统] 正在恢复该任务的历史数据...");
+        });
+      }
+
+      if (typeof safeCloseReportStream === "function") safeCloseReportStream(true);
+      if (typeof stopProgressPolling === "function") stopProgressPolling();
+      if (typeof reportLogManager !== "undefined" && reportLogManager) {
+        reportLogManager.stop();
+        reportLogManager.reset();
+      }
+      if (typeof reportTaskId !== "undefined") reportTaskId = null;
+      if (typeof reportAutoPreviewLoaded !== "undefined") reportAutoPreviewLoaded = false;
+      if (typeof lastCompletedReportTask !== "undefined") lastCompletedReportTask = null;
+      if (typeof autoGenerateTriggered !== "undefined") autoGenerateTriggered = false;
+    } catch (error) {
+      console.warn("[TaskSidebar] 重置task视图状态失败:", error);
+    }
+  }
+
+  function restoreAgentIframes(task) {
+    const taskContext = ctx();
+    if (!taskContext || !task || !task.task_id) return;
+
+    const query = String(task.query || "");
+    const ports = { insight: 8501, media: 8502, query: 8503 };
+    for (const [app, port] of Object.entries(ports)) {
+      try {
+        if (typeof unloadIframe === "function") unloadIframe(app);
+        if (!query || typeof lazyLoadIframe !== "function") continue;
+
+        const iframe = lazyLoadIframe(app);
+        if (!iframe) continue;
+        const params = new URLSearchParams({
+          query,
+          auto_search: "false",
+          view_only: "true",
+          task_id: task.task_id,
+          client_id: taskContext.getClientId(),
+          workspace_id: taskContext.getWorkspaceId()
+        });
+        iframe.src = `http://${window.location.hostname}:${port}?${params.toString()}`;
+      } catch (error) {
+        console.warn(`[TaskSidebar] 恢复 ${app} 页面失败:`, error);
+      }
+    }
+  }
+
+  function restoreTaskData(task) {
+    if (!task || !task.task_id) return;
+
+    const searchInput = document.getElementById("searchInput");
+    if (searchInput) searchInput.value = task.query || "";
+
+    resetTaskViewState();
+    restoreAgentIframes(task);
+
+    try {
+      if (typeof loadConsoleOutput === "function") {
+        ["insight", "media", "query"].forEach(app => loadConsoleOutput(app));
+      }
+      if (typeof refreshForumMessages === "function") refreshForumMessages();
+      if (typeof loadReportInterface === "function") loadReportInterface();
+      if (typeof checkReportLockStatus === "function") checkReportLockStatus();
+      if (typeof updateEmbeddedPage === "function" && typeof currentApp !== "undefined") {
+        updateEmbeddedPage(currentApp);
+      }
+    } catch (error) {
+      console.warn("[TaskSidebar] 恢复task历史数据失败:", error);
+    }
+
+    // Report界面的status接口返回该research task最近一次Report任务。
+    // 已完成时直接恢复预览，而不是重新生成。
+    window.setTimeout(async () => {
+      try {
+        const response = await fetch("/api/report/status");
+        const data = await response.json();
+        const reportTask = data && data.current_task;
+        if (data && data.success && reportTask && reportTask.status === "completed" &&
+            typeof viewReport === "function") {
+          viewReport(reportTask.task_id);
+        }
+      } catch (_) {}
+    }, 300);
+
+    window.setTimeout(() => {
+      try {
+        if (typeof loadConsoleOutput === "function") {
+          ["insight", "media", "query"].forEach(app => loadConsoleOutput(app));
+        }
+        if (typeof refreshForumMessages === "function") refreshForumMessages();
+      } catch (_) {}
+    }, 500);
+  }
+
   async function switchTask(taskId, options = {}) {
     if (!ctx() || !taskId) return;
     try {
+      const previousTaskId = ctx().activeTaskId();
       await ctx().registerTask(taskId, "");
       const task = await fetchTask(taskId);
       ctx().rememberTask(taskId, task.query || "", {
         updateUrl: options.updateUrl !== false,
-        dispatch: true
+        dispatch: false
       });
+      subscribeTask(taskId, previousTaskId);
+      restoreTaskData(task);
       window.dispatchEvent(new CustomEvent("bettafish:task-selected", {
         detail: task
       }));
@@ -427,7 +550,11 @@
       renderTasks();
     });
 
-    window.addEventListener("bettafish:task-changed", () => {
+    window.addEventListener("bettafish:task-changed", event => {
+      const detail = event.detail || {};
+      if (detail.taskId) {
+        subscribeTask(detail.taskId, detail.previousTaskId || "");
+      }
       renderTasks();
       setTimeout(loadTasks, 150);
       setTimeout(loadTasks, 1200);
@@ -470,6 +597,8 @@
     loadTasks,
     switchTask,
     renderTasks,
-    setCollapsed
+    setCollapsed,
+    restoreTaskData,
+    subscribeTask
   });
 })();
