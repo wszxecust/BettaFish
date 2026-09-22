@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterator, Optional
@@ -54,6 +55,129 @@ def task_logs_dir(task_id: str) -> Path:
 def task_clients_dir(task_id: str) -> Path:
     return task_dir(task_id) / "clients"
 
+
+def task_runs_dir(task_id: str) -> Path:
+    return task_dir(task_id) / "runs"
+
+
+def _engine_run_paths(task_id: str, engine: str) -> tuple[Path, Path]:
+    engine = engine.lower().strip()
+    if engine not in _ENGINE_NAMES:
+        raise ValueError(f"未知运行组件: {engine}")
+    directory = task_runs_dir(task_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{engine}.lock", directory / f"{engine}.done"
+
+
+def claim_engine_run(
+    task_id: str,
+    engine: str,
+    *,
+    stale_after_seconds: float = 12 * 60 * 60,
+) -> tuple[Optional[str], str]:
+    """Atomically claim one engine execution for a research task.
+
+    Returns (token, "claimed") for the single caller allowed to execute,
+    otherwise (None, "running") or (None, "completed"). This makes
+    opening the same task from a second browser/device a subscription action
+    instead of accidentally launching duplicate research.
+    """
+    task_id = ensure_task(task_id)
+    lock_path, done_path = _engine_run_paths(task_id, engine)
+    if done_path.exists():
+        return None, "completed"
+
+    if lock_path.exists():
+        try:
+            age = time.time() - lock_path.stat().st_mtime
+        except OSError:
+            age = 0
+        if age <= stale_after_seconds:
+            return None, "running"
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return None, "running"
+
+    token = uuid4().hex
+    try:
+        fd = os.open(
+            lock_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+        )
+    except FileExistsError:
+        return None, "running"
+
+    try:
+        payload = {
+            "token": token,
+            "pid": os.getpid(),
+            "started_at": time.time(),
+        }
+        os.write(fd, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    finally:
+        os.close(fd)
+
+    # Close the tiny race where another worker completed between our first
+    # done-check and acquiring a lock after that worker removed its own lock.
+    if done_path.exists():
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        return None, "completed"
+
+    return token, "claimed"
+
+
+def finish_engine_run(
+    task_id: str,
+    engine: str,
+    token: str,
+    *,
+    success: bool,
+) -> None:
+    """Release a claimed engine run and persist completion only on success."""
+    task_id = validate_runtime_id(task_id)
+    lock_path, done_path = _engine_run_paths(task_id, engine)
+    try:
+        current = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return
+    if current.get("token") != token:
+        return
+
+    if success:
+        tmp = done_path.with_name(f".{done_path.name}.{uuid4().hex}.tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "task_id": task_id,
+                    "engine": engine,
+                    "completed_at": time.time(),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(tmp, done_path)
+
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def engine_run_status(task_id: str, engine: str) -> str:
+    lock_path, done_path = _engine_run_paths(task_id, engine)
+    if done_path.exists():
+        return "completed"
+    if lock_path.exists():
+        return "running"
+    return "idle"
 
 def register_task_client(task_id: str, client_id: str) -> str:
     task_id = validate_runtime_id(task_id)
@@ -120,6 +244,7 @@ def ensure_task(
     task_logs_dir(task_id).mkdir(parents=True, exist_ok=True)
     task_outputs_dir(task_id).mkdir(parents=True, exist_ok=True)
     task_clients_dir(task_id).mkdir(parents=True, exist_ok=True)
+    task_runs_dir(task_id).mkdir(parents=True, exist_ok=True)
     if client_id:
         register_task_client(task_id, client_id)
 
