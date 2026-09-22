@@ -33,9 +33,11 @@ def _connect(task_id: str) -> sqlite3.Connection:
     path = task_forum_db_path(task_id)
     conn = sqlite3.connect(str(path), timeout=30.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
+    # busy_timeout must be active before the first schema/journal operation:
+    # several engine processes can open the same task database simultaneously.
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
