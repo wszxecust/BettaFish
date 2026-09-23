@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable, Tuple
 
 from loguru import logger
+from utils.task_runtime import task_output_dir
 
 from .core import (
     ChapterStorage,
@@ -184,7 +185,7 @@ class ReportAgent:
     _CONTENT_SPARSE_WARNING_TEXT = "本章LLM生成的内容字数可能过低，必要时可以尝试重新运行程序。"
     _STRUCTURAL_RETRY_ATTEMPTS = 2
     
-    def __init__(self, config: Optional[Settings] = None):
+    def __init__(self, config: Optional[Settings] = None, task_id: Optional[str] = None):
         """
         初始化Report Agent。
         
@@ -199,9 +200,10 @@ class ReportAgent:
         """
         # 加载配置
         self.config = config or settings
+        self.task_id = task_id
         
-        # 初始化文件基准管理器
-        self.file_baseline = FileCountBaseline()
+        # task-scoped ReportAgent不读取/写入历史全局baseline；仅legacy CLI保留。
+        self.file_baseline = None if self.task_id else FileCountBaseline()
         
         # 初始化日志
         self._setup_logging()
@@ -219,8 +221,8 @@ class ReportAgent:
         # 初始化节点
         self._initialize_nodes()
         
-        # 初始化文件数量基准
-        self._initialize_file_baseline()
+        # 旧版全局文件数量基准不再参与运行时输入选择。
+        # ReportEngine现在由research_task_id直接定位三个task输出目录。
         
         # 状态
         self.state = ReportState()
@@ -242,6 +244,15 @@ class ReportAgent:
         - 【修复】配置实时日志写入，禁用缓冲，确保前端实时看到日志
         - 【修复】防止重复添加handler
         """
+        # task-scoped运行由utils.task_runtime.task_log_context提供带task_id
+        # filter的loguru sink。这里绝不能再添加“捕获所有Report日志”的全局sink，
+        # 否则并发任务会互相写入对方文件。
+        if self.task_id:
+            log_path = Path(self.config.LOG_FILE)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.touch(exist_ok=True)
+            return
+
         # 确保日志目录存在
         log_dir = os.path.dirname(self.config.LOG_FILE)
         os.makedirs(log_dir, exist_ok=True)
@@ -326,6 +337,8 @@ class ReportAgent:
             'media': 'media_engine_streamlit_reports',
             'query': 'query_engine_streamlit_reports'
         }
+        if self.file_baseline is None:
+            return
         self.file_baseline.initialize_baseline(directories)
     
     def _initialize_llm(self) -> LLMClient:
@@ -404,7 +417,8 @@ class ReportAgent:
     
     def generate_report(self, query: str, reports: List[Any], forum_logs: str = "",
                         custom_template: str = "", save_report: bool = True,
-                        stream_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None) -> str:
+                        stream_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+                        research_task_id: Optional[str] = None) -> str:
         """
         生成综合报告（章节JSON → IR → HTML）。
 
@@ -756,7 +770,7 @@ class ReportAgent:
 
             saved_files = {}
             if save_report:
-                saved_files = self._save_report(html_report, document_ir, report_id)
+                saved_files = self._save_report(html_report, document_ir, report_id, research_task_id=research_task_id)
                 emit('stage', {'stage': 'report_saved', 'files': saved_files})
 
             generation_time = (datetime.now() - start_time).total_seconds()
@@ -1305,7 +1319,7 @@ class ReportAgent:
 *生成时间：{generation_time}*
 """
     
-    def _save_report(self, html_content: str, document_ir: Dict[str, Any], report_id: str) -> Dict[str, Any]:
+    def _save_report(self, html_content: str, document_ir: Dict[str, Any], report_id: str, research_task_id: Optional[str] = None) -> Dict[str, Any]:
         """
         保存HTML与IR到文件并返回路径信息。
 
@@ -1326,18 +1340,28 @@ class ReportAgent:
         ).rstrip()
         query_safe = query_safe.replace(" ", "_")[:30] or "report"
 
+        if research_task_id:
+            output_root = task_output_dir(research_task_id, "report")
+            ir_root = output_root / "ir"
+        else:
+            # 仅为直接调用ReportAgent的兼容路径保留旧目录。
+            output_root = Path(self.config.OUTPUT_DIR)
+            ir_root = Path(self.config.DOCUMENT_IR_OUTPUT_DIR)
+        output_root.mkdir(parents=True, exist_ok=True)
+        ir_root.mkdir(parents=True, exist_ok=True)
+
         html_filename = f"final_report_{query_safe}_{timestamp}.html"
-        html_path = Path(self.config.OUTPUT_DIR) / html_filename
+        html_path = output_root / html_filename
         html_path.write_text(html_content, encoding="utf-8")
         html_abs = str(html_path.resolve())
         html_rel = os.path.relpath(html_abs, os.getcwd())
 
-        ir_path = self._save_document_ir(document_ir, query_safe, timestamp)
+        ir_path = self._save_document_ir(document_ir, query_safe, timestamp, output_dir=ir_root)
         ir_abs = str(ir_path.resolve())
         ir_rel = os.path.relpath(ir_abs, os.getcwd())
 
         state_filename = f"report_state_{query_safe}_{timestamp}.json"
-        state_path = Path(self.config.OUTPUT_DIR) / state_filename
+        state_path = output_root / state_filename
         self.state.save_to_file(str(state_path))
         state_abs = str(state_path.resolve())
         state_rel = os.path.relpath(state_abs, os.getcwd())
@@ -1358,7 +1382,7 @@ class ReportAgent:
             'state_relative_path': state_rel,
         }
 
-    def _save_document_ir(self, document_ir: Dict[str, Any], query_safe: str, timestamp: str) -> Path:
+    def _save_document_ir(self, document_ir: Dict[str, Any], query_safe: str, timestamp: str, output_dir: Optional[Path] = None) -> Path:
         """
         将整本IR写入独立目录。
 
@@ -1374,7 +1398,9 @@ class ReportAgent:
             Path: 指向保存后的IR文件路径。
         """
         filename = f"report_ir_{query_safe}_{timestamp}.json"
-        ir_path = Path(self.config.DOCUMENT_IR_OUTPUT_DIR) / filename
+        ir_root = output_dir or Path(self.config.DOCUMENT_IR_OUTPUT_DIR)
+        ir_root.mkdir(parents=True, exist_ok=True)
+        ir_path = ir_root / filename
         ir_path.write_text(
             json.dumps(document_ir, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -1530,7 +1556,7 @@ class ReportAgent:
         return content
 
 
-def create_agent(config_file: Optional[str] = None) -> ReportAgent:
+def create_agent(config_file: Optional[str] = None, *, config: Optional[Settings] = None, task_id: Optional[str] = None) -> ReportAgent:
     """
     创建Report Agent实例的便捷函数。
     
@@ -1543,5 +1569,5 @@ def create_agent(config_file: Optional[str] = None) -> ReportAgent:
     目前以环境变量驱动 `Settings`，保留 `config_file` 参数便于未来扩展。
     """
     
-    config = Settings() # 以空配置初始化，而从从环境变量初始化
-    return ReportAgent(config)
+    resolved_config = config or Settings()  # 默认仍从环境变量初始化
+    return ReportAgent(resolved_config, task_id=task_id)

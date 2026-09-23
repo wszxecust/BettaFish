@@ -30,6 +30,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from QueryEngine import DeepSearchAgent, Settings
 from config import settings
 from utils.github_issues import error_with_issue_link
+from utils.task_runtime import (
+    claim_engine_run,
+    engine_run_status,
+    ensure_task,
+    finish_engine_run,
+    latest_task_report,
+    new_task_id,
+    task_log_context,
+    task_output_dir,
+)
 
 
 def main():
@@ -50,11 +60,17 @@ def main():
         query_params = st.query_params
         auto_query = query_params.get('query', '')
         auto_search = query_params.get('auto_search', 'false').lower() == 'true'
+        view_only = query_params.get('view_only', 'false').lower() == 'true'
+        auto_task_id = query_params.get('task_id', '')
+        auto_client_id = query_params.get('client_id', '')
     except AttributeError:
         # 兼容旧版本
         query_params = st.experimental_get_query_params()
         auto_query = query_params.get('query', [''])[0]
         auto_search = query_params.get('auto_search', ['false'])[0].lower() == 'true'
+        view_only = query_params.get('view_only', ['false'])[0].lower() == 'true'
+        auto_task_id = query_params.get('task_id', [''])[0]
+        auto_client_id = query_params.get('client_id', [''])[0]
 
     # ----- 配置被硬编码 -----
     # 强制使用 DeepSeek
@@ -78,12 +94,36 @@ def main():
         label_visibility="hidden"
     )
 
-    # 自动搜索逻辑
+    # 自动搜索逻辑：同一浏览器会话可以连续运行多个独立task。
     start_research = False
     query = auto_query
+    task_id = (auto_task_id or '').strip() or new_task_id()
+    client_id = (auto_client_id or '').strip() or None
+    execution_key = f"auto_search_executed:{task_id}"
 
-    if auto_search and auto_query and 'auto_search_executed' not in st.session_state:
-        st.session_state.auto_search_executed = True
+    # 历史task只读恢复：绝不claim运行锁，也绝不重新执行Agent。
+    if view_only and auto_query:
+        status = engine_run_status(task_id, "query")
+        report_path = latest_task_report(task_id, "query")
+        if report_path and report_path.exists():
+            if status == "failed":
+                st.warning("Query Agent上次运行失败，下面显示失败前已保存的结果。")
+            elif status == "running":
+                st.info("Query Agent仍在运行，下面显示当前已保存的结果。")
+            else:
+                st.info("Query Agent历史结果")
+            st.markdown(report_path.read_text(encoding="utf-8"))
+        elif status == "running":
+            st.info("Query Agent正在运行，可在主界面实时日志中查看进度。")
+        elif status == "failed":
+            st.error("Query Agent上次运行失败，暂无可恢复的报告。")
+        else:
+            st.info("Query Agent暂无已保存结果。")
+        return
+
+    if auto_search and auto_query and execution_key not in st.session_state:
+        ensure_task(task_id, client_id=client_id, query=query)
+        st.session_state[execution_key] = True
         start_research = True
     elif auto_query and not auto_search:
         st.warning("等待搜索启动信号...")
@@ -114,14 +154,51 @@ def main():
             TAVILY_API_KEY=tavily_key,
             MAX_REFLECTIONS=max_reflections,
             SEARCH_CONTENT_MAX_LENGTH=max_content_length,
-            OUTPUT_DIR="query_engine_streamlit_reports"
+            OUTPUT_DIR=str(task_output_dir(task_id, "query"))
         )
 
         # 执行研究
-        execute_research(query, config)
+        execute_research(query, config, task_id)
 
 
-def execute_research(query: str, config: Settings):
+def execute_research(query: str, config: Settings, task_id: str):
+    """保证同一task的Query Agent只执行一次；其他设备只订阅/查看。"""
+    run_token, run_status = claim_engine_run(task_id, "query")
+    if run_status == "running":
+        st.session_state.pop(f"auto_search_executed:{task_id}", None)
+        st.info("该任务的Query Agent已在其他页面运行，本页面不会重复启动。")
+        return False
+    if run_status == "completed":
+        st.info("该任务的Query Agent已经完成，直接显示已保存结果。")
+        report_path = latest_task_report(task_id, "query")
+        if report_path and report_path.exists():
+            st.markdown(report_path.read_text(encoding="utf-8"))
+        return True
+
+    if run_status == "failed":
+        st.error("该任务的Query Agent上次运行失败。历史查看不会自动重新执行；请新建研究后重试。")
+        report_path = latest_task_report(task_id, "query")
+        if report_path and report_path.exists():
+            st.markdown(report_path.read_text(encoding="utf-8"))
+        return False
+
+    success = False
+    try:
+        with task_log_context(task_id, "query"):
+            success = bool(_execute_research(query, config, task_id))
+        return success
+    finally:
+        finish_engine_run(
+            task_id,
+            "query",
+            run_token,
+            success=success,
+        )
+        if not success:
+            st.session_state.pop(f"auto_search_executed:{task_id}", None)
+
+
+def _execute_research(query: str, config: Settings, task_id: str):
     """执行研究"""
     try:
         # 创建进度条
@@ -130,7 +207,7 @@ def execute_research(query: str, config: Settings):
 
         # 初始化Agent
         status_text.text("正在初始化Agent...")
-        agent = DeepSearchAgent(config)
+        agent = DeepSearchAgent(config, task_id=task_id)
         st.session_state.agent = agent
 
         progress_bar.progress(10)
@@ -171,6 +248,7 @@ def execute_research(query: str, config: Settings):
 
         # 显示结果
         display_results(agent, final_report)
+        return True
 
     except Exception as e:
         import traceback
@@ -182,6 +260,7 @@ def execute_research(query: str, config: Settings):
         )
         st.error(error_display)
         logger.exception(f"研究过程中发生错误: {str(e)}")
+        return False
 
 
 def display_results(agent: DeepSearchAgent, final_report: str):

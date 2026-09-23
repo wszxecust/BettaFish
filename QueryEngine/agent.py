@@ -22,11 +22,12 @@ from .state import State
 from .tools import TavilyNewsAgency, TavilyResponse
 from .utils import Settings, format_search_results_for_prompt
 from loguru import logger
+from utils.task_runtime import ensure_task, new_task_id, task_output_dir
 
 class DeepSearchAgent:
     """Deep Search Agent主类"""
     
-    def __init__(self, config: Optional[Settings] = None):
+    def __init__(self, config: Optional[Settings] = None, task_id: Optional[str] = None):
         """
         初始化Deep Search Agent
         
@@ -36,6 +37,9 @@ class DeepSearchAgent:
         # 加载配置
         from .utils.config import settings
         self.config = config or settings
+        self.task_id = task_id
+        self.task_id = ensure_task(task_id or new_task_id())
+        self.output_dir = str(task_output_dir(self.task_id, "query"))
         
         # 初始化LLM客户端
         self.llm_client = self._initialize_llm()
@@ -50,7 +54,7 @@ class DeepSearchAgent:
         self.state = State()
         
         # 确保输出目录存在
-        os.makedirs(self.config.OUTPUT_DIR, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
         
         logger.info(f"Query Agent已初始化")
         logger.info(f"使用LLM: {self.llm_client.get_model_info()}")
@@ -68,8 +72,8 @@ class DeepSearchAgent:
         """初始化处理节点"""
         self.first_search_node = FirstSearchNode(self.llm_client)
         self.reflection_node = ReflectionNode(self.llm_client)
-        self.first_summary_node = FirstSummaryNode(self.llm_client)
-        self.reflection_summary_node = ReflectionSummaryNode(self.llm_client)
+        self.first_summary_node = FirstSummaryNode(self.llm_client, self.task_id, "QUERY")
+        self.reflection_summary_node = ReflectionSummaryNode(self.llm_client, self.task_id, "QUERY")
         self.report_formatting_node = ReportFormattingNode(self.llm_client)
     
     def _validate_date_format(self, date_str: str) -> bool:
@@ -431,7 +435,7 @@ class DeepSearchAgent:
         query_safe = query_safe.replace(' ', '_')[:30]
         
         filename = f"deep_search_report_{query_safe}_{timestamp}.md"
-        filepath = os.path.join(self.config.OUTPUT_DIR, filename)
+        filepath = os.path.join(self.output_dir, filename)
         
         # 保存报告
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -442,7 +446,7 @@ class DeepSearchAgent:
         # 保存状态（如果配置允许）
         if self.config.SAVE_INTERMEDIATE_STATES:
             state_filename = f"state_{query_safe}_{timestamp}.json"
-            state_filepath = os.path.join(self.config.OUTPUT_DIR, state_filename)
+            state_filepath = os.path.join(self.output_dir, state_filename)
             self.state.save_to_file(state_filepath)
             logger.info(f"状态已保存到: {state_filepath}")
     
@@ -461,7 +465,7 @@ class DeepSearchAgent:
         logger.info(f"状态已保存到 {filepath}")
 
 
-def create_agent() -> DeepSearchAgent:
+def create_agent(task_id: Optional[str] = None) -> DeepSearchAgent:
     """
     创建Deep Search Agent实例的便捷函数
     
@@ -470,4 +474,4 @@ def create_agent() -> DeepSearchAgent:
     """
     from .utils.config import Settings
     config = Settings()
-    return DeepSearchAgent(config)
+    return DeepSearchAgent(config, task_id=task_id)
